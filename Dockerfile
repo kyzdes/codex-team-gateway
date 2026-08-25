@@ -1,7 +1,17 @@
-# Образ шлюза заявок. Внутри два непривилегированных пользователя:
+# --- Сборка интерфейса (React 19 + HeroUI v3 + Tailwind v4) ------------------
+FROM node:22-bookworm-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+# vite складывает результат в ../static → /static
+RUN npm run build
+
+# --- Образ шлюза ------------------------------------------------------------
+# Внутри два непривилегированных пользователя:
 #   gateway — веб-приложение, держит GitHub-токен и токены доступа;
 #   agent   — процессы Codex, работают с кодом проекта и токенов не видят.
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl ca-certificates python3 python3-venv sudo gosu tini \
@@ -22,7 +32,7 @@ RUN python3 -m venv /srv/venv \
  && /srv/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
-COPY static ./static
+COPY --from=web /static ./static
 COPY AGENTS.md.template ./
 COPY docker/run-agent.sh /usr/local/bin/run-agent.sh
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh

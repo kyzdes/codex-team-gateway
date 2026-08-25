@@ -6,3 +6,5 @@ venv/
 data/
 *.db
 .DS_Store
+node_modules/
+static/

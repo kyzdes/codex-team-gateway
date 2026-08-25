@@ -137,10 +137,21 @@ gosu agent env HOME=/home/agent codex login --device-auth
 
 ## Разработка
 
+Бэкенд:
+
 ```bash
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 .venv/bin/python tests/e2e.py          # сквозной прогон без GitHub и без Codex
+```
+
+Интерфейс — React 19 + [HeroUI v3](https://heroui.com) + Tailwind CSS v4, собирается Vite
+в каталог `static/`, откуда его отдаёт FastAPI (отдельный веб-сервер не нужен).
+`static/` не хранится в репозитории — его собирает Docker при сборке образа:
+
+```bash
+cd web && npm install && npm run build   # разово, чтобы открыть интерфейс локально
+npm run dev                              # разработка: vite на :5173, API проксируется на :8799
 ```
 
 `tests/e2e.py` поднимает локальный bare-репозиторий вместо GitHub и заглушку
@@ -165,4 +176,5 @@ DATA_DIR=/tmp/gw-ui USERS="anna:Анна" ADMIN_TOKEN=demo PROJECT_REPO=acme/dem
 | `app/deploy.py` | Ожидание выкатки: Dokploy API или health-адрес |
 | `app/auth.py` | Люди и персональные ссылки |
 | `app/main.py` | HTTP API и админка |
-| `static/` | Интерфейс: один HTML, один CSS, один JS |
+| `web/src/` | Интерфейс на HeroUI: список заявок, карточка заявки, админка |
+| `web/src/status.ts` | Единая таблица статусов: человеческие подписи и шаги |

@@ -3,8 +3,10 @@
 .env
 .env.example
 README.md
-docs/
 data/
+static/
+web/node_modules/
+web/dist/
 *.pyc
 __pycache__/
 venv/
