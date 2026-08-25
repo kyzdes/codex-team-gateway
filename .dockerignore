@@ -1,0 +1,12 @@
+state/
+logs/
+gateway_config.json
+.git
+.gitignore
+README.md
+install.sh
+setup-project.sh
+systemd/
+__pycache__/
+*.pyc
+venv/

@@ -1,0 +1,36 @@
+services:
+  codex-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codex-team-gateway:latest
+    restart: unless-stopped
+    environment:
+      # Задайте в Dokploy → Environment (или через .env рядом с этим файлом):
+      #   CODEX_API_KEY=sk-...      — для автологина Codex CLI по API-ключу
+      - CODEX_API_KEY=${CODEX_API_KEY:-}
+    ports:
+      # В Dokploy проще пробросить порт через вкладку Domains на этот сервис,
+      # но explicit-порт тоже можно оставить для прямого доступа/健康-проверок.
+      - "${GATEWAY_PORT:-8787}:8787"
+    volumes:
+      # Именованные volume — переживают редеплой (Dokploy пересобирает код
+      # из репозитория при каждом деплое, но volume остаются нетронутыми).
+      - codex_home:/home/codex/.codex        # логин/сессии Codex CLI
+      - codex_projects:/home/codex/projects   # клонированный проект + worktree коллег
+      - codex_config:/config                  # config.json с токенами доступа
+      - codex_state:/app/state                # история переписки по каждому коллеге
+      - codex_logs:/app/logs                  # аудиторский JSONL-лог всех запросов
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/api/health-check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  codex_home:
+  codex_projects:
+  codex_config:
+  codex_state:
+  codex_logs:

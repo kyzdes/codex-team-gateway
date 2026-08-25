@@ -227,6 +227,11 @@ async def history(authorization: Optional[str] = Header(None)):
     return {"display_name": USERS[user].get("display_name", user), "history": state.get("history", [])}
 
 
+@app.get("/api/health-check")
+async def health_check():
+    return {"status": "ok"}
+
+
 @app.get("/api/whoami")
 async def whoami(authorization: Optional[str] = Header(None)):
     user = authenticate(authorization)

@@ -24,12 +24,14 @@
   сохраняется на диск — единственная страховка при отсутствии
   подтверждений в моменте.
 
-## Установка в 2 команды
+## Установка в 2 команды (обычная Ubuntu, без Docker)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kyzdes/codex-team-gateway/main/install.sh | sudo bash
 sudo -u codex /opt/codex-team-gateway/setup-project.sh <git-url-вашего-проекта> colleague1 colleague2
 ```
+
+Если у вас VPS с [Dokploy](https://dokploy.com/) — смотрите раздел «Деплой через Dokploy» ниже, там процесс ещё проще (через веб-интерфейс).
 
 Первая команда ставит Node.js, Codex CLI, Python-зависимости шлюза,
 генерирует токены доступа и поднимает systemd-сервис на порту 8787
@@ -48,6 +50,24 @@ codex login --device-auth   # один раз авторизовать Codex CLI
 Откройте `/etc/codex-gateway/config.json` — там уже сгенерированы токены
 и прописаны пути к worktree-папкам. Отдайте каждому коллеге его токен и
 адрес шлюза (см. «Удалённый доступ» ниже).
+
+## Деплой через Dokploy
+
+В репозитории есть `Dockerfile` и `docker-compose.yml`, готовые для Dokploy «out из коробки».
+
+1. **Create Application → Compose** в Dokploy, укажите этот репозиторий как источник (ветка `main`, файл `docker-compose.yml` в корне).
+2. В **Environment** добавьте переменную `CODEX_API_KEY` — это API-ключ OpenAI, через него Codex CLI автоматически залогинится при старте контейнера — интерактивный OAuth-вход внутри контейнера без браузера невозможен. Если удобнее войти аккаунтом ChatGPT (не API-ключом) — войдите в контейнер вручную (см. ниже) и выполните `codex login --device-auth`.
+3. Нажмите **Deploy**. Dokploy сам соберёт образ и запустит сервис. Все данные (логин Codex, проект, токены, логи) хранятся в изолированных Docker-волюмах и переживают каждый редеплой (в отличие от кода репозитория, который Dokploy переклонирует при каждом деплое).
+4. **Пробросьте домен/порт**: во вкладке **Domains** укажите контейнерный порт `8787`. Dokploy выдаст HTTPS-адрес через встроенный Traefik. **Важно**: при полной автономности Codex и доступе к инфраструктуре открывать этот адрес наружу без дополнительной авторизации рискованно — включите в Dokploy Traefik Basic Auth на этот домен либо ограничьте доступ по IP/VPN (Tailscale на той же VPS).
+5. **Привязать ваш проект и сделать worktree коллегам** — в Dokploy откройте **Terminal** для сервиса (или `docker exec -it <container> bash` с самого VPS) и выполните:
+   ```bash
+   gosu codex bash /app/docker-setup-project.sh <git-url-вашего-проекта> colleague1 colleague2
+   ```
+6. Открыть `/config/config.json` внутри контейнера (`gosu codex cat /config/config.json`), забрать сгенерированные токены и отдать их коллегам вместе с адресом из шага 4.
+
+Заметка про персистентность: `docker-compose.yml` уже исходно хранит логин Codex, проект, токены, историю и логи в изолированных Docker-волюмах, а не в директории репозитория — это обязательно для Dokploy, потому что он заново клонирует репозиторий при каждом деплое, и любые данные там были бы стерты.
+
+Обновить версию в Dokploy: просто нажмите **Redeploy** после push в `main` — образ пересоберётся, волюмы останутся нетронутые.
 
 ## Автономность и риски
 
@@ -104,8 +124,12 @@ Access с логином по email.
 
 | Файл | Назначение |
 |---|---|
-| `install.sh` | Установщик: Node.js, Codex CLI, Python-зависимости, systemd |
-| `setup-project.sh` | Клонирует ваш проект, создаёт worktree на каждого коллегу |
+| `install.sh` | Установщик для обычной Ubuntu: Node.js, Codex CLI, Python-зависимости, systemd |
+| `setup-project.sh` | (без Docker) Клонирует ваш проект, создаёт worktree на каждого коллегу |
+| `Dockerfile` | Образ для Dokploy/Docker: Node.js + Codex CLI + Python + шлюз |
+| `docker-compose.yml` | Compose-файл для Dokploy с волюмами для персистентности |
+| `docker-entrypoint.sh` | Старт-скрипт контейнера: генерация конфига, логин Codex по API-ключу |
+| `docker-setup-project.sh` | (в Docker/Dokploy) Аналог `setup-project.sh`, вызывается через `docker exec` |
 | `app.py` | Backend шлюза (FastAPI): аутентификация по токену, запуск `codex exec`, история |
 | `static/index.html` | Чат-интерфейс в браузере |
 | `gateway_config.example.json` | Пример конфига (реальный лежит в `/etc/codex-gateway/config.json`) |
