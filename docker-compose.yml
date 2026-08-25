@@ -1,36 +1,51 @@
 services:
-  codex-gateway:
+  gateway:
     build:
       context: .
       dockerfile: Dockerfile
-    image: codex-team-gateway:latest
     restart: unless-stopped
     environment:
-      # Задайте в Dokploy → Environment (или через .env рядом с этим файлом):
-      #   CODEX_API_KEY=sk-...      — для автологина Codex CLI по API-ключу
-      - CODEX_API_KEY=${CODEX_API_KEY:-}
-    ports:
-      # В Dokploy проще пробросить порт через вкладку Domains на этот сервис,
-      # но explicit-порт тоже можно оставить для прямого доступа/健康-проверок.
-      - "${GATEWAY_PORT:-8787}:8787"
+      # Проект
+      PROJECT_REPO: ${PROJECT_REPO}
+      PROJECT_BASE_BRANCH: ${PROJECT_BASE_BRANCH:-main}
+      PROJECT_PROD_URL: ${PROJECT_PROD_URL:-}
+      PROJECT_HEALTH_PATH: ${PROJECT_HEALTH_PATH:-/healthz}
+      PROJECT_TEST_CMD: ${PROJECT_TEST_CMD:-}
+      # Доступы
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GITHUB_REQUIRED_CHECK: ${GITHUB_REQUIRED_CHECK:-tests}
+      GITHUB_MERGE_METHOD: ${GITHUB_MERGE_METHOD:-squash}
+      CODEX_API_KEY: ${CODEX_API_KEY:-}
+      USERS: ${USERS}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      # Агент
+      CODEX_SANDBOX: ${CODEX_SANDBOX:-workspace-write}
+      CODEX_NETWORK_ACCESS: ${CODEX_NETWORK_ACCESS:-true}
+      CODEX_MODEL: ${CODEX_MODEL:-}
+      MAX_CONCURRENT_RUNS: ${MAX_CONCURRENT_RUNS:-2}
+      # Витрина
+      BRAND_NAME: ${BRAND_NAME:-Правки}
+      BRAND_SUBTITLE: ${BRAND_SUBTITLE:-изменения на сайте без разработчика}
+      BRAND_ACCENT: ${BRAND_ACCENT:-#3f6fff}
+      # Слежение за выкаткой (необязательно)
+      DOKPLOY_URL: ${DOKPLOY_URL:-}
+      DOKPLOY_TOKEN: ${DOKPLOY_TOKEN:-}
+      DOKPLOY_APPLICATION_ID: ${DOKPLOY_APPLICATION_ID:-}
+    expose:
+      # Порт НЕ публикуется на хост: наружу сервис выходит только через
+      # домен Dokploy (вкладка Domains), где стоит HTTPS и, при желании,
+      # Basic Auth или ограничение по IP.
+      - "8787"
     volumes:
-      # Именованные volume — переживают редеплой (Dokploy пересобирает код
-      # из репозитория при каждом деплое, но volume остаются нетронутыми).
-      - codex_home:/home/codex/.codex        # логин/сессии Codex CLI
-      - codex_projects:/home/codex/projects   # клонированный проект + worktree коллег
-      - codex_config:/config                  # config.json с токенами доступа
-      - codex_state:/app/state                # история переписки по каждому коллеге
-      - codex_logs:/app/logs                  # аудиторский JSONL-лог всех запросов
+      - data:/data                    # репозиторий, worktree, база заявок, логи
+      - codex_home:/home/agent/.codex  # авторизация Codex, переживает редеплой
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/api/health-check"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 20s
 
 volumes:
+  data:
   codex_home:
-  codex_projects:
-  codex_config:
-  codex_state:
-  codex_logs:

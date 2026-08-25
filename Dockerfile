@@ -1,46 +1,38 @@
-# codex-team-gateway — образ для деплоя через Dokploy (или любой Docker/Compose хостинг)
+# Образ шлюза заявок. Внутри два непривилегированных пользователя:
+#   gateway — веб-приложение, держит GitHub-токен и токены доступа;
+#   agent   — процессы Codex, работают с кодом проекта и токенов не видят.
 FROM node:20-bookworm-slim
 
-# Codex CLI пишет и читает файлы проекта от имени обычного пользователя,
-# а не root — так безопаснее, если Codex сам исполняет shell-команды.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git curl python3 python3-venv python3-pip openssl gosu tini \
-      build-essential ca-certificates \
+      git curl ca-certificates python3 python3-venv sudo gosu tini \
     && rm -rf /var/lib/apt/lists/*
 
-# Codex CLI (глобально, доступен и root, и обычному пользователю)
-RUN npm install -g @openai/codex
+RUN npm install -g @openai/codex && npm cache clean --force
 
-RUN useradd -m -u 1000 -s /bin/bash codex
+RUN groupadd -g 10003 work \
+ && useradd -m -u 10001 -g work -s /bin/bash gateway \
+ && useradd -m -u 10002 -g work -s /bin/bash agent \
+ && echo 'gateway ALL=(agent) NOPASSWD: /usr/local/bin/run-agent.sh' > /etc/sudoers.d/gateway \
+ && chmod 0440 /etc/sudoers.d/gateway
 
-WORKDIR /app
+WORKDIR /srv
 COPY requirements.txt ./
-RUN python3 -m venv /app/venv \
-    && /app/venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /app/venv/bin/pip install --no-cache-dir -r requirements.txt
+RUN python3 -m venv /srv/venv \
+ && /srv/venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /srv/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ./
+COPY app ./app
 COPY static ./static
-COPY AGENTS.md.template deploy.sh.template gateway_config.example.json ./
-COPY docker-setup-project.sh ./
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh /app/docker-setup-project.sh
+COPY AGENTS.md.template ./
+COPY docker/run-agent.sh /usr/local/bin/run-agent.sh
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/run-agent.sh /usr/local/bin/entrypoint.sh
 
-# Директории, которые должны жить в volume (см. docker-compose.yml):
-#   /home/codex/.codex        — логин/сессии Codex CLI (codex login сохраняется тут)
-#   /home/codex/projects       — клонированный репозиторий + worktree на коллег
-#   /config                    — gateway config.json с токенами
-#   /app/state, /app/logs      — история переписки и аудиторские логи
-RUN mkdir -p /home/codex/.codex /home/codex/projects /config /app/state /app/logs \
-    && chown -R codex:codex /home/codex /app/state /app/logs /config
-
-ENV CODEX_GATEWAY_CONFIG=/config/config.json \
-    CODEX_GATEWAY_STATE_DIR=/app/state \
-    CODEX_GATEWAY_LOG_DIR=/app/logs \
-    CODEX_BIN=codex \
-    HOME=/home/codex
+ENV DATA_DIR=/data \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 EXPOSE 8787
-
-ENTRYPOINT ["tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
-CMD ["/app/venv/bin/uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8787"]
+ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint.sh"]
+# --no-access-log: в ссылках доступа есть токен, ему не место в логах контейнера.
+CMD ["/srv/venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8787", "--no-access-log"]

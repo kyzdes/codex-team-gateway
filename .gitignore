@@ -1,11 +1,8 @@
 __pycache__/
 *.pyc
-venv/
 .venv/
-state/
-logs/
-*.log
-gateway_config.json
-/etc/codex-gateway/
+venv/
 .env
+data/
+*.db
 .DS_Store
