@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS requests (
     checks_detail TEXT,
     files        TEXT,
     text_changes TEXT,
+    images       TEXT,
     tests_local  TEXT,
     tests_output TEXT,
     error        TEXT,
@@ -55,11 +56,16 @@ CREATE INDEX IF NOT EXISTS idx_events_request ON events(request_id);
 CREATE INDEX IF NOT EXISTS idx_requests_user ON requests(user, id DESC);
 """
 
-JSON_FIELDS = {"user_visible", "files", "text_changes"}
+JSON_FIELDS = {"user_visible", "files", "text_changes", "images"}
 
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# Столбцы, добавленные после первого релиза: CREATE TABLE IF NOT EXISTS их
+# не создаст, поэтому досыпаем вручную при старте.
+LATER_COLUMNS = {"images": "TEXT"}
 
 
 def connect() -> sqlite3.Connection:
@@ -69,6 +75,10 @@ def connect() -> sqlite3.Connection:
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.executescript(SCHEMA)
+        existing = {row["name"] for row in _conn.execute("PRAGMA table_info(requests)")}
+        for column, kind in LATER_COLUMNS.items():
+            if column not in existing:
+                _conn.execute(f"ALTER TABLE requests ADD COLUMN {column} {kind}")
         _conn.commit()
     return _conn
 

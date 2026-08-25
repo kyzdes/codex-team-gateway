@@ -1,28 +1,35 @@
 import { useState } from "react";
 import { Button, Card, TextArea } from "@heroui/react";
+import { AttachButton, AttachmentStrip, dropHandlers, pasteHandler, useAttachments } from "./Images";
 
-export function Composer({ onSubmit }: { onSubmit: (text: string) => Promise<void> }) {
+export function Composer({
+  onSubmit,
+}: {
+  onSubmit: (text: string, images: string[]) => Promise<void>;
+}) {
   const [text, setText] = useState("");
   const [pending, setPending] = useState(false);
+  const attachments = useAttachments();
 
   const send = async () => {
     const value = text.trim();
     if (value.length < 5) return;
     setPending(true);
     try {
-      await onSubmit(value);
+      await onSubmit(value, attachments.ids);
       setText("");
+      attachments.reset();
     } finally {
       setPending(false);
     }
   };
 
   return (
-    <Card>
+    <Card {...dropHandlers(attachments.add)}>
       <Card.Header>
         <Card.Title className="text-base">Что поправить на сайте?</Card.Title>
       </Card.Header>
-      <Card.Content>
+      <Card.Content className="flex flex-col gap-3">
         <TextArea
           aria-label="Текст заявки"
           className="min-h-24 w-full"
@@ -30,13 +37,21 @@ export function Composer({ onSubmit }: { onSubmit: (text: string) => Promise<voi
           value={text}
           variant="secondary"
           onChange={(event) => setText(event.target.value)}
+          onPaste={pasteHandler(attachments.add)}
         />
+        <AttachmentStrip items={attachments.items} onRemove={attachments.remove} />
+        <AttachButton hint={!attachments.items.length} onPick={attachments.add} />
       </Card.Content>
       <Card.Footer className="flex items-center gap-3">
         <p className="text-muted flex-1 text-xs">
-          Опишите словами, как объяснили бы коллеге. Если что-то будет непонятно — переспросим.
+          Опишите словами, как объяснили бы коллеге. Если что-то не получается объяснить — покажите
+          скриншотом.
         </p>
-        <Button isDisabled={text.trim().length < 5} isPending={pending} onPress={send}>
+        <Button
+          isDisabled={text.trim().length < 5 || attachments.uploading}
+          isPending={pending}
+          onPress={send}
+        >
           Отправить
         </Button>
       </Card.Footer>

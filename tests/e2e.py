@@ -47,8 +47,10 @@ FAKE_CODEX_SOURCE = '''#!/usr/bin/env python3
 """Заглушка Codex: печатает события того же формата, что `codex exec --json`."""
 import json, subprocess, sys, pathlib
 
-prompt = sys.argv[-1]
 resume = "resume" in sys.argv
+images = sys.argv.count("-i")
+# Текст заявки — последний позиционный аргумент перед флагами картинок.
+prompt = sys.argv[-1 - images * 2]
 thread = "th-1"
 
 def emit(obj):
@@ -79,7 +81,7 @@ emit({"type": "item.completed", "item": {"id": "i4", "type": "agent_message",
       "text": json.dumps({"status": "done", "title": "Новый телефон на главной",
                           "summary": "Заменил телефон на главной странице.",
                           "user_visible": ["В шапке сайта новый номер"],
-                          "risk": "low", "notes": ""}, ensure_ascii=False)}})
+                          "risk": "low", "notes": f"images={images}"}, ensure_ascii=False)}})
 emit({"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 5}})
 '''
 
@@ -175,7 +177,28 @@ async def main() -> None:
     check(any("Изучаю проект" in t for t in texts), "команды переведены на человеческий язык")
     check(not any("/bin/bash" in t for t in texts), "сырых shell-команд в ленте нет")
 
-    print("\n7. Заявка, где менять нечего")
+    print("\n7. Заявка со скриншотом")
+    from app import uploads
+
+    png = (b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    staged = uploads.save_staged("anna", png)
+    check(staged.endswith(".png"), "картинка принята и переименована")
+    check(uploads.staged_path("anna", "../../etc/passwd") is None, "выход из каталога не проходит")
+    try:
+        uploads.save_staged("anna", "<html>не картинка</html>".encode())
+        check(False, "не-картинка отклонена")
+    except uploads.UploadError:
+        check(True, "не-картинка отклонена")
+
+    rid3 = db.create_request("anna", "Вот скриншот, поправьте телефон как на нём")
+    attached = uploads.attach(rid3, "anna", [staged])
+    db.update_request(rid3, images=attached)
+    await pipeline._process(rid3, None)
+    request3 = db.get_request(rid3)
+    check(request3["notes"] == "images=1", f"агент получил картинку флагом -i (получено: {request3['notes']})")
+    check(request3["images"] == attached, "картинка привязана к заявке")
+
+    print("\n8. Заявка, где менять нечего")
     rid2 = db.create_request("anna", "Поменяй телефон на сайте")
     await pipeline._process(rid2, None)
     await pipeline._process(rid2, None)  # второй прогон: правка уже на месте

@@ -44,6 +44,31 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   return payload as T;
 }
 
+/** Загрузка картинки: FormData сам проставит boundary, Content-Type не трогаем. */
+export async function uploadImage(file: File): Promise<string> {
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch("/api/uploads", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+  if (response.status === 401) {
+    forgetToken();
+    throw new Unauthorized("Ссылка больше не действует");
+  }
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error((payload as { detail?: string }).detail ?? "Не удалось загрузить картинку");
+  return (payload as { id: string }).id;
+}
+
+/** Картинки закрыты токеном, поэтому тянем их запросом и показываем как blob. */
+export async function fetchImage(path: string): Promise<string> {
+  const response = await fetch(path, { headers: { Authorization: `Bearer ${token}` } });
+  if (!response.ok) throw new Error("Картинка недоступна");
+  return URL.createObjectURL(await response.blob());
+}
+
 /**
  * Живая лента событий. EventSource не умеет заголовки, поэтому читаем поток
  * сами — так токен не попадает в адресную строку и в логи сервера.

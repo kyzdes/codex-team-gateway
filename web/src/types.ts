@@ -23,6 +23,7 @@ export interface RequestItem {
   checks_detail?: string | null;
   files: string[];
   text_changes: TextChange[];
+  images: string[];
   error?: string | null;
   created_at: string;
   updated_at: string;

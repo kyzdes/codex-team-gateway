@@ -6,7 +6,7 @@ DATA_DIR="${DATA_DIR:-/data}"
 AGENT_HOME="/home/agent"
 
 echo "==> Готовлю каталоги данных"
-install -d -m 2775 -o gateway -g work "$DATA_DIR" "$DATA_DIR/worktrees" "$DATA_DIR/logs"
+install -d -m 2775 -o gateway -g work "$DATA_DIR" "$DATA_DIR/worktrees" "$DATA_DIR/logs" "$DATA_DIR/uploads"
 install -d -m 0700 -o agent -g work "$AGENT_HOME/.codex"
 
 # Полный chown нужен только один раз — на свежем томе. Дальше файлы уже

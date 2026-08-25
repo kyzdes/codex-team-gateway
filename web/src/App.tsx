@@ -139,11 +139,11 @@ export default function App() {
       <main className="mx-auto grid w-full max-w-[1180px] flex-1 grid-cols-1 items-start gap-5 px-4 pt-5 pb-10 lg:grid-cols-[minmax(320px,400px)_1fr]">
         <section className={`flex flex-col gap-3 ${selected ? "hidden lg:flex" : "flex"}`}>
           <Composer
-            onSubmit={async (text) => {
+            onSubmit={async (text, images) => {
               try {
                 const created = await api<RequestItem>("/api/requests", {
                   method: "POST",
-                  body: JSON.stringify({ body: text }),
+                  body: JSON.stringify({ body: text, images }),
                 });
                 upsert(created);
                 void select(created.id);
@@ -175,8 +175,8 @@ export default function App() {
               events={events}
               me={me}
               request={selected}
-              onAnswer={async (text) => {
-                await act(`/api/requests/${selected.id}/answer`, { text });
+              onAnswer={async (text, images) => {
+                await act(`/api/requests/${selected.id}/answer`, { text, images });
               }}
               onApprove={async () => {
                 await act(`/api/requests/${selected.id}/approve`);

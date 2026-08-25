@@ -64,7 +64,7 @@ def _sudo_prefix() -> list[str]:
     return ["sudo", "-n", "-H", "-u", user, AGENT_WRAPPER]
 
 
-def build_command(prompt: str, thread_id: str | None) -> list[str]:
+def build_command(prompt: str, thread_id: str | None, images: list[Path] | None = None) -> list[str]:
     cmd = [*_sudo_prefix(), settings.codex_bin, "-a", "never", "-s", settings.codex_sandbox]
     if settings.codex_sandbox == "workspace-write":
         flag = "true" if settings.codex_network else "false"
@@ -76,6 +76,11 @@ def build_command(prompt: str, thread_id: str | None) -> list[str]:
         cmd += ["resume", thread_id, prompt]
     else:
         cmd += [prompt]
+    # Важен порядок: `-i` принимает несколько значений подряд и, стоя перед
+    # текстом, съедает его как ещё один файл. Поэтому только после промпта
+    # и по одному флагу на картинку.
+    for image in images or []:
+        cmd += ["-i", str(image)]
     return cmd
 
 
@@ -143,8 +148,9 @@ async def run(
     thread_id: str | None,
     log_path: Path,
     on_progress: Progress,
+    images: list[Path] | None = None,
 ) -> CodexResult:
-    cmd = build_command(prompt, thread_id)
+    cmd = build_command(prompt, thread_id, images)
     env = dict(os.environ)
     # Ни один секрет шлюза не должен попасть в окружение агента.
     for leaky in ("GITHUB_TOKEN", "DOKPLOY_TOKEN", "ADMIN_TOKEN", "USERS", "TELEGRAM_BOT_TOKEN"):

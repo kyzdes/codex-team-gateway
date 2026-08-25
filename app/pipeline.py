@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from . import auth, bus, codex_runner, db, deploy, github, gitops
+from . import auth, bus, codex_runner, db, deploy, github, gitops, uploads
 from .config import settings
 
 # --- статусы --------------------------------------------------------------
@@ -74,7 +74,14 @@ RESULT_SCHEMA = """{
 }"""
 
 
-def build_prompt(request: dict[str, Any], branch: str) -> str:
+IMAGES_NOTE = (
+    "\n\nК сообщению приложены картинки — почти всегда это скриншоты сайта, "
+    "сделанные самим сотрудником. Считай их основным описанием проблемы: то, "
+    "что человек не сумел объяснить словами, обычно видно на них."
+)
+
+
+def build_prompt(request: dict[str, Any], branch: str, has_images: bool = False) -> str:
     if settings.test_cmd:
         tests = f"Обязательно прогони `{settings.test_cmd}` и добейся, чтобы всё проходило."
     else:
@@ -102,16 +109,16 @@ def build_prompt(request: dict[str, Any], branch: str) -> str:
 Формат ответа: твоё последнее сообщение должно быть одним JSON-объектом, без markdown-обёртки и без пояснений вокруг:
 {RESULT_SCHEMA}
 
-В summary пиши так, будто объясняешь коллеге из отдела продаж."""
+В summary пиши так, будто объясняешь коллеге из отдела продаж.{IMAGES_NOTE if has_images else ""}"""
 
 
-def build_followup_prompt(request: dict[str, Any], answer: str) -> str:
+def build_followup_prompt(request: dict[str, Any], answer: str, has_images: bool = False) -> str:
     return f"""{auth.display_name(request['user'])} ответил на твой вопрос:
 <<<
 {answer.strip()}
 >>>
 
-Продолжай заявку по тем же правилам: правки в этой же рабочей копии, локальный коммит, никакого пуша. Последнее сообщение — снова один JSON-объект того же формата."""
+Продолжай заявку по тем же правилам: правки в этой же рабочей копии, локальный коммит, никакого пуша. Последнее сообщение — снова один JSON-объект того же формата.{IMAGES_NOTE if has_images else ""}"""
 
 
 # --- шаги пайплайна -------------------------------------------------------
@@ -242,7 +249,7 @@ async def _guarded(request_id: int, coro_name: str, coro: Any) -> None:
         await emit(request_id, "error", f"Внутренняя ошибка: {exc}")
 
 
-async def _process(request_id: int, followup: str | None) -> None:
+async def _process(request_id: int, followup: str | None, images: list[str] | None = None) -> None:
     async with semaphore():
         request = db.get_request(request_id)
         if not request or request["status"] == CANCELLED:
@@ -250,11 +257,16 @@ async def _process(request_id: int, followup: str | None) -> None:
         set_status(request_id, WORKING, error="", question="")
         await emit(request_id, "system", "Взял заявку в работу" if not followup else "Продолжаю с учётом ответа")
 
+        # На первом прогоне отдаём агенту все картинки заявки, на следующих —
+        # только новые: старые он уже видел в этом же треде.
+        turn_images = images if followup else (images or request.get("images") or [])
+        image_paths = uploads.paths_for(request_id, turn_images or [])
+
         await gitops.ensure_repo()
         if followup and request.get("branch") and gitops.worktree_path(request_id).exists():
             path = gitops.worktree_path(request_id)
             branch = request["branch"]
-            prompt = build_followup_prompt(request, followup)
+            prompt = build_followup_prompt(request, followup, bool(image_paths))
             thread_id = request.get("thread_id")
         else:
             path, branch = await gitops.create_worktree(request_id)
@@ -263,19 +275,25 @@ async def _process(request_id: int, followup: str | None) -> None:
             enriched = dict(request)
             if followup:
                 enriched["body"] = f"{request['body'].strip()}\n\nУточнение от сотрудника: {followup.strip()}"
-            prompt = build_prompt(enriched, branch)
+            # Заново — значит заново со всеми картинками заявки.
+            image_paths = uploads.paths_for(request_id, request.get("images") or [])
+            prompt = build_prompt(enriched, branch, bool(image_paths))
             thread_id = None
             db.update_request(request_id, branch=branch)
 
         async def on_progress(kind: str, text: str) -> None:
             await emit(request_id, kind, text)
 
-        result = await codex_runner.run(prompt, path, thread_id, _log_path(request_id), on_progress)
+        result = await codex_runner.run(
+            prompt, path, thread_id, _log_path(request_id), on_progress, image_paths
+        )
         await _handle_agent_result(request_id, result, path, branch)
 
 
-def start(request_id: int, followup: str | None = None) -> None:
-    task = asyncio.create_task(_guarded(request_id, "Обработка заявки", _process(request_id, followup)))
+def start(request_id: int, followup: str | None = None, images: list[str] | None = None) -> None:
+    task = asyncio.create_task(
+        _guarded(request_id, "Обработка заявки", _process(request_id, followup, images))
+    )
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
 
@@ -345,6 +363,8 @@ async def checks_watcher(interval: int = 20) -> None:
             for request in db.requests_in_statuses([CHECKING]):
                 await _refresh_checks(request)
             tick += 1
+            if tick % 30 == 0:
+                uploads.sweep_staging()
             if tick % 3 == 0:
                 for request in db.requests_in_statuses([REVIEW]):
                     await _detect_external_merge(request)

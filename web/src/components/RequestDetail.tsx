@@ -3,6 +3,14 @@ import { Alert, Button, Card, Link, Separator, TextArea } from "@heroui/react";
 import type { EventItem, Me, RequestItem } from "../types";
 import { CANCELLABLE, STEPS, clockTime, statusOf, titleOf, when } from "../status";
 import { StatusChip } from "./RequestList";
+import {
+  AttachButton,
+  AttachmentStrip,
+  AuthedImage,
+  dropHandlers,
+  pasteHandler,
+  useAttachments,
+} from "./Images";
 
 function Steps({ request }: { request: RequestItem }) {
   const meta = statusOf(request);
@@ -68,13 +76,14 @@ function Actions({
 }: {
   request: RequestItem;
   me: Me;
-  onAnswer: (text: string) => Promise<void>;
+  onAnswer: (text: string, images: string[]) => Promise<void>;
   onApprove: () => Promise<void>;
   onCancel: () => Promise<void>;
   onRetry: () => Promise<void>;
 }) {
   const [answer, setAnswer] = useState("");
   const [pending, setPending] = useState(false);
+  const attachments = useAttachments();
 
   const run = async (action: () => Promise<void>) => {
     setPending(true);
@@ -95,28 +104,34 @@ function Actions({
             <Alert.Description>{request.question}</Alert.Description>
           </Alert.Content>
         </Alert>
-        <div className="flex flex-col items-start gap-2">
+        <div className="flex flex-col items-start gap-2" {...dropHandlers(attachments.add)}>
           <TextArea
             aria-label="Ваш ответ"
             className="w-full"
-            placeholder="Ваш ответ"
+            placeholder="Ваш ответ — можно вставить скриншот"
             rows={3}
             value={answer}
             variant="secondary"
             onChange={(event) => setAnswer(event.target.value)}
+            onPaste={pasteHandler(attachments.add)}
           />
-          <Button
-            isDisabled={!answer.trim()}
-            isPending={pending}
-            onPress={() =>
-              run(async () => {
-                await onAnswer(answer.trim());
-                setAnswer("");
-              })
-            }
-          >
-            Ответить
-          </Button>
+          <AttachmentStrip items={attachments.items} onRemove={attachments.remove} />
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              isDisabled={!answer.trim() || attachments.uploading}
+              isPending={pending}
+              onPress={() =>
+                run(async () => {
+                  await onAnswer(answer.trim(), attachments.ids);
+                  setAnswer("");
+                  attachments.reset();
+                })
+              }
+            >
+              Ответить
+            </Button>
+            <AttachButton onPick={attachments.add} />
+          </div>
         </div>
       </Section>
     );
@@ -288,7 +303,7 @@ export function RequestDetail(props: {
   events: EventItem[];
   me: Me;
   onBack: () => void;
-  onAnswer: (text: string) => Promise<void>;
+  onAnswer: (text: string, images: string[]) => Promise<void>;
   onApprove: () => Promise<void>;
   onCancel: () => Promise<void>;
   onRetry: () => Promise<void>;
@@ -325,6 +340,17 @@ export function RequestDetail(props: {
         <div className="bg-surface-secondary rounded-lg px-3.5 py-3 whitespace-pre-wrap">
           {request.body}
         </div>
+        {request.images?.length ? (
+          <div className="flex flex-wrap gap-2">
+            {request.images.map((name) => (
+              <AuthedImage
+                key={name}
+                alt="Картинка к заявке"
+                path={`/api/requests/${request.id}/images/${name}`}
+              />
+            ))}
+          </div>
+        ) : null}
       </Section>
 
       <Actions {...props} />

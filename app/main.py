@@ -8,12 +8,12 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, bus, db, deploy, github, gitops, pipeline
+from . import auth, bus, db, deploy, github, gitops, pipeline, uploads
 from .config import settings
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -88,10 +88,12 @@ def owned(request_id: int, user: Principal) -> dict[str, Any]:
 
 class NewRequest(BaseModel):
     body: str = Field(min_length=5, max_length=8000)
+    images: list[str] = Field(default_factory=list, max_length=uploads.MAX_PER_MESSAGE)
 
 
 class Answer(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
+    images: list[str] = Field(default_factory=list, max_length=uploads.MAX_PER_MESSAGE)
 
 
 # --- жизненный цикл приложения -------------------------------------------
@@ -127,9 +129,59 @@ async def list_requests(user: Principal = Depends(current_user)) -> dict[str, An
 @app.post("/api/requests", status_code=201)
 async def create_request(payload: NewRequest, user: Principal = Depends(current_user)) -> dict[str, Any]:
     request_id = db.create_request(user.login, payload.body.strip())
+    try:
+        attached = uploads.attach(request_id, user.login, payload.images)
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if attached:
+        db.update_request(request_id, images=attached)
     await pipeline.emit(request_id, "system", "Заявка принята")
+    if attached:
+        await pipeline.emit(request_id, "system", f"Приложено картинок: {len(attached)}")
     pipeline.start(request_id)
     return db.get_request(request_id) or {"id": request_id}
+
+
+@app.post("/api/uploads", status_code=201)
+async def upload_image(
+    file: UploadFile = File(...), user: Principal = Depends(current_user)
+) -> dict[str, str]:
+    """Картинка кладётся в личный черновик и прикрепляется при отправке заявки."""
+    data = await file.read(uploads.MAX_BYTES + 1)
+    try:
+        name = uploads.save_staged(user.login, data)
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"id": name}
+
+
+@app.get("/api/uploads/{name}")
+async def staged_image(name: str, user: Principal = Depends(current_user)) -> FileResponse:
+    path = uploads.staged_path(user.login, name)
+    if not path:
+        raise HTTPException(status_code=404, detail="Картинка не найдена")
+    return FileResponse(
+        str(path),
+        media_type=uploads.content_type(name),
+        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=300"},
+    )
+
+
+@app.get("/api/requests/{request_id}/images/{name}")
+async def request_image(
+    request_id: int, name: str, user: Principal = Depends(current_user)
+) -> FileResponse:
+    request = owned(request_id, user)
+    if name not in (request.get("images") or []):
+        raise HTTPException(status_code=404, detail="Картинка не найдена")
+    path = uploads.attached_path(request_id, name)
+    if not path:
+        raise HTTPException(status_code=404, detail="Картинка не найдена")
+    return FileResponse(
+        str(path),
+        media_type=uploads.content_type(name),
+        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=3600"},
+    )
 
 
 @app.get("/api/requests/{request_id}")
@@ -144,8 +196,14 @@ async def answer(request_id: int, payload: Answer, user: Principal = Depends(cur
     request = owned(request_id, user)
     if request["status"] != pipeline.NEEDS_INPUT:
         raise HTTPException(status_code=409, detail="Сейчас заявка не ждёт ответа")
+    try:
+        attached = uploads.attach(request_id, user.login, payload.images)
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if attached:
+        db.update_request(request_id, images=[*(request.get("images") or []), *attached])
     await pipeline.emit(request_id, "user", payload.text.strip())
-    pipeline.start(request_id, followup=payload.text.strip())
+    pipeline.start(request_id, followup=payload.text.strip(), images=attached)
     return {"ok": True}
 
 
@@ -174,6 +232,9 @@ async def retry(request_id: int, user: Principal = Depends(current_user)) -> dic
     if request.get("pr_number") and request["status"] not in pipeline.FINAL:
         await pipeline.cancel(request_id)
     new_id = db.create_request(request["user"], request["body"])
+    carried = uploads.clone(request_id, new_id, request.get("images") or [])
+    if carried:
+        db.update_request(new_id, images=carried)
     await pipeline.emit(new_id, "system", f"Повтор заявки №{request_id}")
     pipeline.start(new_id)
     return db.get_request(new_id) or {"id": new_id}
