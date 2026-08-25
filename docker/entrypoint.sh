@@ -6,14 +6,17 @@ DATA_DIR="${DATA_DIR:-/data}"
 AGENT_HOME="/home/agent"
 
 echo "==> Готовлю каталоги данных"
-install -d -m 2775 -o gateway -g work "$DATA_DIR" "$DATA_DIR/worktrees" "$DATA_DIR/logs" "$DATA_DIR/uploads"
+install -d -m 2775 -o gateway -g work "$DATA_DIR" "$DATA_DIR/worktrees" "$DATA_DIR/uploads"
+# Логи прогонов — переписка по чужим заявкам, группе там делать нечего.
+# База закрывается отдельно, из самого приложения (db._restrict_permissions).
+install -d -m 0750 -o gateway -g work "$DATA_DIR/logs"
 install -d -m 0700 -o agent -g work "$AGENT_HOME/.codex"
 
 # Полный chown нужен только один раз — на свежем томе. Дальше файлы уже
 # создаются нужными пользователями, а рекурсия по репозиторию дорогая.
 if [[ ! -f "$DATA_DIR/.initialized" ]]; then
   chown -R gateway:work "$DATA_DIR"
-  find "$DATA_DIR" -type d -exec chmod 2775 {} + || true
+  find "$DATA_DIR" -type d -not -path "$DATA_DIR/logs*" -exec chmod 2775 {} + || true
   touch "$DATA_DIR/.initialized"
   chown gateway:work "$DATA_DIR/.initialized"
 fi

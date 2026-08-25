@@ -30,6 +30,23 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_choice(name: str, allowed: set[str], default: str) -> str:
+    """Значение из фиксированного набора.
+
+    Опечатка в переменной не должна превращаться в третий, никому не известный
+    режим работы: тот, кто читает настройку, вправе рассчитывать ровно на один
+    из перечисленных вариантов и не проверять её ещё раз.
+    """
+    value = _env(name).lower()
+    return value if value in allowed else default
+
+
+# Обёртка, через которую шлюз запускает что-либо от имени пользователя-агента
+# (docker/run-agent.sh). Путь фиксирован образом и намеренно не берётся из
+# окружения: настраиваемый путь означал бы «запусти под sudo что попросят».
+AGENT_WRAPPER = "/usr/local/bin/run-agent.sh"
+
+
 @dataclass(frozen=True)
 class Settings:
     # --- Брендирование (клиент видит это в интерфейсе) -----------------
@@ -70,6 +87,13 @@ class Settings:
     codex_model: str = field(default_factory=lambda: _env("CODEX_MODEL"))
     codex_timeout: int = field(default_factory=lambda: _env_int("CODEX_TIMEOUT", 3600))
     max_concurrent: int = field(default_factory=lambda: _env_int("MAX_CONCURRENT_RUNS", 2))
+    # Осознанное разрешение работать без отдельного пользователя агента.
+    # По умолчанию выключено: без изоляции дочерний процесс читает
+    # /proc/<pid шлюза>/environ и достаёт оттуда всё, что вычистил clean_env().
+    # Нужно ровно для локальной разработки и тестов.
+    allow_unisolated_agent: bool = field(
+        default_factory=lambda: _env_bool("ALLOW_UNISOLATED_AGENT", False)
+    )
 
     # --- Dokploy (опционально: показывать статус выкатки) ---------------
     dokploy_url: str = field(default_factory=lambda: _env("DOKPLOY_URL").rstrip("/"))
@@ -79,6 +103,22 @@ class Settings:
 
     # --- Уведомления (опционально) --------------------------------------
     telegram_token: str = field(default_factory=lambda: _env("TELEGRAM_BOT_TOKEN"))
+
+    # --- Правила приёма и подтверждения ---------------------------------
+    # Кто подтверждает выкатку: "user" — автор заявки, "admin" — только
+    # администратор. Второй режим нужен там, где сотруднику нельзя давать
+    # последнее слово перед продом.
+    approval_policy: str = field(
+        default_factory=lambda: _env_choice("APPROVAL_POLICY", {"user", "admin"}, "user")
+    )
+    # Каждая заявка — это оплаченный прогон агента, поэтому «нажал десять раз,
+    # потому что не понял, приняли ли» не должно стоить десяти прогонов.
+    # 0 — снять ограничение.
+    rate_limit_per_hour: int = field(default_factory=lambda: _env_int("RATE_LIMIT_PER_HOUR", 20))
+    # Потолок черновиков картинок на человека: забытые скриншоты иначе съедают volume.
+    upload_quota_mb: int = field(default_factory=lambda: _env_int("UPLOAD_QUOTA_MB", 64))
+    # Сколько дней держим логи агента и картинки уже завершённых заявок.
+    retention_days: int = field(default_factory=lambda: _env_int("RETENTION_DAYS", 60))
 
     # --- Данные ---------------------------------------------------------
     data_dir: Path = field(default_factory=lambda: Path(_env("DATA_DIR", "/data")))
@@ -102,6 +142,10 @@ class Settings:
     @property
     def users_path(self) -> Path:
         return self.data_dir / "users.json"
+
+    @property
+    def agent_wrapper(self) -> str:
+        return AGENT_WRAPPER
 
     @property
     def repo_owner(self) -> str:
@@ -133,6 +177,20 @@ class Settings:
             out.append(f"CODEX_SANDBOX={self.codex_sandbox!r} — недопустимое значение")
         if self.merge_method not in {"merge", "squash", "rebase"}:
             out.append(f"GITHUB_MERGE_METHOD={self.merge_method!r} — допустимо merge|squash|rebase")
+        # Аргументы команды видны любому процессу контейнера через
+        # /proc/<pid>/cmdline, поэтому учётке в адресе репозитория там не место.
+        host = self.clone_url.split("//", 1)[-1].split("/", 1)[0]
+        if "@" in host:
+            out.append(
+                "PROJECT_GIT_URL содержит логин или токен в адресе — он попадёт в "
+                "аргументы git clone, а их читает любой процесс контейнера"
+            )
+        raw_policy = _env("APPROVAL_POLICY")
+        if raw_policy and raw_policy.lower() != self.approval_policy:
+            out.append(
+                f"APPROVAL_POLICY={raw_policy!r} — допустимо user|admin, "
+                f"сейчас действует {self.approval_policy}"
+            )
         return out
 
 

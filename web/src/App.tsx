@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Toast, toast } from "@heroui/react";
+import { Alert, Toast, toast } from "@heroui/react";
 import { Unauthorized, api, initToken, listen } from "./api";
-import { ATTENTION, statusOf, titleOf } from "./status";
+import { ATTENTION, isPaused, loadMeta, statusOf, titleOf } from "./status";
 import type { EventItem, Me, RequestItem, StreamPayload } from "./types";
 import { Gate, TopBar } from "./components/Shell";
 import { Composer } from "./components/Composer";
@@ -28,8 +28,15 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [events, setEvents] = useState<EventItem[]>([]);
   const [adminOpen, setAdminOpen] = useState(false);
+  const [paused, setPaused] = useState(false);
   const selectedRef = useRef<number | null>(null);
   selectedRef.current = selectedId;
+  // Зеркало списка для потока событий: колбэк живёт дольше одного рендера.
+  const requestsRef = useRef<RequestItem[]>([]);
+  requestsRef.current = requests;
+  // Было ли уже соединение с лентой: второй и последующие «hello» означают,
+  // что связь рвалась.
+  const connected = useRef(false);
 
   const fail = (error: unknown) => {
     if (error instanceof Unauthorized) {
@@ -66,23 +73,22 @@ export default function App() {
     }
   }, [upsert]);
 
-  // Первичная загрузка
+  // Первичная загрузка. Токена в браузере может и не быть: вход мог случиться
+  // по ссылке ?k=..., которую сервер уже обменял на cookie-сессию.
   useEffect(() => {
     const token = initToken();
-    if (!token) {
-      setGate("");
-      return;
-    }
     (async () => {
       try {
         const profile = await api<Me>("/api/me");
         applyTheme(profile.brand.accent);
         document.title = profile.brand.name;
+        await loadMeta();
+        setPaused(isPaused());
         setMe(profile);
         setGate(null);
         await refresh();
       } catch (error) {
-        if (error instanceof Unauthorized) setGate("Ссылка больше не действует.");
+        if (error instanceof Unauthorized) setGate(token ? "Ссылка больше не действует." : "");
         else setGate((error as Error).message);
       }
     })();
@@ -92,27 +98,36 @@ export default function App() {
   useEffect(() => {
     if (!me) return undefined;
     return listen((payload: StreamPayload) => {
-      if (payload.type === "request") {
-        setRequests((current) => {
-          const previous = current.find((item) => item.id === payload.request.id);
-          if (!previous || previous.status !== payload.request.status) {
-            notify(payload.request, me);
-          }
-          const index = current.findIndex((item) => item.id === payload.request.id);
-          if (index === -1) return [payload.request, ...current];
-          const next = [...current];
-          next[index] = { ...next[index], ...payload.request };
-          return next;
-        });
+      if (payload.type === "hello") {
+        // Этим кадром начинается каждое соединение. Первый — обычный старт,
+        // любой следующий значит, что лента прерывалась: пока её не было,
+        // статусы уехали, а догнать их событиями уже нельзя.
+        if (!connected.current) {
+          connected.current = true;
+          return;
+        }
+        void refresh().catch(fail);
+        const opened = selectedRef.current;
+        if (opened !== null) void select(opened);
+      } else if (payload.type === "request") {
+        // Уведомление считаем до setState: апдейтер обязан быть чистым, иначе
+        // в StrictMode он выполняется дважды и уведомление дублируется.
+        const previous = requestsRef.current.find((item) => item.id === payload.request.id);
+        if (!previous || previous.status !== payload.request.status) notify(payload.request, me);
+        upsert(payload.request);
       } else if (payload.type === "event" && payload.request_id === selectedRef.current) {
         setEvents((current) => [...current, payload]);
       }
     });
-  }, [me]);
+  }, [me, refresh, select, upsert]);
 
   useEffect(() => {
+    if (!me) return undefined;
     const onVisible = () => {
-      if (document.visibilityState === "visible" && me) document.title = me.brand.name;
+      if (document.visibilityState !== "visible") return;
+      document.title = me.brand.name;
+      // Пока вкладка была в фоне, администратор мог поставить приём на паузу.
+      void loadMeta().then(() => setPaused(isPaused()));
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
@@ -122,11 +137,14 @@ export default function App() {
 
   const selected = requests.find((item) => item.id === selectedId) ?? null;
 
+  // Показать ошибку мало: вызывающий по молчанию считает отправку удачной и
+  // чистит поле, а человек остаётся без своего текста. Поэтому пробрасываем.
   const act = async (path: string, body?: unknown) => {
     try {
       await api(path, { method: "POST", body: body ? JSON.stringify(body) : undefined });
     } catch (error) {
       fail(error);
+      throw error;
     }
   };
 
@@ -134,10 +152,26 @@ export default function App() {
     <div className="flex min-h-full flex-col">
       <Toast.Provider placement="bottom end" />
       <TopBar me={me} onOpenAdmin={() => setAdminOpen(true)} />
-      <AdminModal isOpen={adminOpen} onClose={() => setAdminOpen(false)} />
+      <AdminModal
+        isOpen={adminOpen}
+        onClose={() => setAdminOpen(false)}
+        onPausedChange={setPaused}
+      />
 
       <main className="mx-auto grid w-full max-w-[1180px] flex-1 grid-cols-1 items-start gap-5 px-4 pt-5 pb-10 lg:grid-cols-[minmax(320px,400px)_1fr]">
         <section className={`flex flex-col gap-3 ${selected ? "hidden lg:flex" : "flex"}`}>
+          {paused ? (
+            <Alert className="bg-warning-soft" status="warning">
+              <Alert.Indicator />
+              <Alert.Content>
+                <Alert.Title>Приём заявок приостановлен</Alert.Title>
+                <Alert.Description>
+                  Заявку примем и сохраним, но за работу возьмёмся, когда администратор снимет
+                  паузу.
+                </Alert.Description>
+              </Alert.Content>
+            </Alert>
+          ) : null}
           <Composer
             onSubmit={async (text, images) => {
               try {
@@ -152,6 +186,7 @@ export default function App() {
                 }
               } catch (error) {
                 fail(error);
+                throw error;
               }
             }}
           />

@@ -17,8 +17,12 @@ export function Composer({
     setPending(true);
     try {
       await onSubmit(value, attachments.ids);
+      // Поля чистим только после успеха: на отказе по лимиту или обрыве связи
+      // человек не должен набирать длинную просьбу заново.
       setText("");
       attachments.reset();
+    } catch {
+      /* об ошибке уже сказал вызывающий */
     } finally {
       setPending(false);
     }
@@ -33,6 +37,7 @@ export function Composer({
         <TextArea
           aria-label="Текст заявки"
           className="min-h-24 w-full"
+          maxLength={8000}
           placeholder="Например: на странице «Доставка» замените телефон на +7 999 123-45-67"
           value={text}
           variant="secondary"

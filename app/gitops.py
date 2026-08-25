@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -36,27 +38,42 @@ class Facts:
     head_sha: str = ""
     files: list[dict[str, str]] = field(default_factory=list)
     text_changes: list[dict[str, str]] = field(default_factory=list)
-    insertions: int = 0
-    deletions: int = 0
 
 
-def _auth_config() -> list[str]:
-    """Токен подкладывается заголовком на время команды, а не пишется в .git/config."""
+def _auth_env() -> dict[str, str] | None:
+    """Учётка для одной команды — через окружение, а не через аргументы.
+
+    Раньше токен уезжал в argv (`git -c http.extraHeader=...`), а /proc/<pid>/cmdline
+    на Linux читает любой пользователь — то есть пользователь агента доставал
+    оттуда GitHub-токен шлюза и мог пушить в репозиторий клиента мимо PR и мимо
+    кнопки человека. Окружение процесса закрыто по uid, поэтому GIT_CONFIG_*
+    (git ≥ 2.31) не видно никому, кроме самого шлюза.
+    """
     if not settings.github_token:
-        return []
+        return None
     basic = base64.b64encode(f"x-access-token:{settings.github_token}".encode()).decode()
-    return ["-c", f"http.extraHeader=Authorization: Basic {basic}"]
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.extraHeader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}",
+    }
 
 
 async def git(*args: str, cwd: Path | None = None, auth: bool = False, check: bool = True) -> str:
-    cmd = ["git", *(_auth_config() if auth else []), *args]
+    env: dict[str, str] | None = None
+    if auth:
+        extra = _auth_env()
+        if extra:
+            env = {**os.environ, **extra}
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            "git",
+            *args,
             cwd=str(cwd) if cwd else None,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
     except (FileNotFoundError, NotADirectoryError) as exc:
         # Каталог репозитория ещё не создан (первый запуск, клон не прошёл).
@@ -112,9 +129,21 @@ async def create_worktree(request_id: int) -> tuple[Path, str]:
 
 
 async def remove_worktree(request_id: int) -> None:
+    """Снять рабочую копию заявки. Зовётся на каждом финале заявки, поэтому
+    обязана быть безобидной: worktree могло не быть вовсе, а репозитория —
+    ещё не появиться (первый запуск, клон не прошёл)."""
     path = worktree_path(request_id)
+    if not (settings.repo_dir / ".git").exists():
+        shutil.rmtree(path, ignore_errors=True)
+        return
     await git("worktree", "remove", "--force", str(path), cwd=settings.repo_dir, check=False)
+    # git мог отказаться снять копию (каталог держит недобитый процесс агента).
+    # Оставленный каталог потом мешает создать worktree заново, поэтому добиваем.
+    shutil.rmtree(path, ignore_errors=True)
     await git("worktree", "prune", cwd=settings.repo_dir, check=False)
+    # Локальная ветка своё отработала: нужное уже уехало в origin, ненужное
+    # не понадобится — иначе они копятся в репозитории по одной на заявку.
+    await git("branch", "-D", branch_name(request_id), cwd=settings.repo_dir, check=False)
 
 
 async def has_uncommitted(path: Path) -> bool:
@@ -142,12 +171,6 @@ async def collect_facts(path: Path) -> Facts:
         parts = line.split("\t")
         if len(parts) >= 2:
             facts.files.append({"status": parts[0][:1], "path": parts[-1]})
-
-    stat = (await git("diff", "--shortstat", f"{base}...HEAD", cwd=path)).strip()
-    ins = re.search(r"(\d+) insertion", stat)
-    dele = re.search(r"(\d+) deletion", stat)
-    facts.insertions = int(ins.group(1)) if ins else 0
-    facts.deletions = int(dele.group(1)) if dele else 0
 
     facts.text_changes = _extract_text_changes(
         await git("diff", "-U0", f"{base}...HEAD", cwd=path)

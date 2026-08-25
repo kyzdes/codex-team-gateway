@@ -11,17 +11,27 @@ services:
       PROJECT_PROD_URL: ${PROJECT_PROD_URL:-}
       PROJECT_HEALTH_PATH: ${PROJECT_HEALTH_PATH:-/healthz}
       PROJECT_TEST_CMD: ${PROJECT_TEST_CMD:-}
+      PROJECT_TEST_TIMEOUT: ${PROJECT_TEST_TIMEOUT:-900}
       # Доступы
       GITHUB_TOKEN: ${GITHUB_TOKEN}
       GITHUB_REQUIRED_CHECK: ${GITHUB_REQUIRED_CHECK:-tests}
       GITHUB_MERGE_METHOD: ${GITHUB_MERGE_METHOD:-squash}
+      GITHUB_PR_LABELS: ${GITHUB_PR_LABELS:-}
       CODEX_API_KEY: ${CODEX_API_KEY:-}
       USERS: ${USERS}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      # Правила приёма и подтверждения. Перечислены здесь не для красоты:
+      # переменная, не упомянутая в этом блоке, в контейнер не попадает, и
+      # администратор молча остаётся на значении по умолчанию.
+      APPROVAL_POLICY: ${APPROVAL_POLICY:-user}
+      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-20}
+      UPLOAD_QUOTA_MB: ${UPLOAD_QUOTA_MB:-64}
+      RETENTION_DAYS: ${RETENTION_DAYS:-60}
       # Агент
       CODEX_SANDBOX: ${CODEX_SANDBOX:-workspace-write}
       CODEX_NETWORK_ACCESS: ${CODEX_NETWORK_ACCESS:-true}
       CODEX_MODEL: ${CODEX_MODEL:-}
+      CODEX_TIMEOUT: ${CODEX_TIMEOUT:-3600}
       MAX_CONCURRENT_RUNS: ${MAX_CONCURRENT_RUNS:-2}
       # Витрина
       BRAND_NAME: ${BRAND_NAME:-Правки}
@@ -31,6 +41,7 @@ services:
       DOKPLOY_URL: ${DOKPLOY_URL:-}
       DOKPLOY_TOKEN: ${DOKPLOY_TOKEN:-}
       DOKPLOY_APPLICATION_ID: ${DOKPLOY_APPLICATION_ID:-}
+      DEPLOY_TIMEOUT: ${DEPLOY_TIMEOUT:-900}
     expose:
       # Порт НЕ публикуется на хост: наружу сервис выходит только через
       # домен Dokploy (вкладка Domains), где стоит HTTPS и, при желании,

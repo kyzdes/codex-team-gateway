@@ -1,36 +1,86 @@
-import { useEffect, useState } from "react";
-import { Alert, Button, Modal, Separator, Spinner } from "@heroui/react";
-import { api } from "../api";
-import type { AdminOverview } from "../types";
+import { Modal, Tabs } from "@heroui/react";
+import type { MetaPayload } from "../types";
+import { useAdminData } from "./admin/shared";
+import { JournalTab } from "./admin/JournalTab";
+import { PeopleTab } from "./admin/PeopleTab";
+import { ReadinessTab } from "./admin/ReadinessTab";
+import { SettingsTab } from "./admin/SettingsTab";
+import { UsageTab } from "./admin/UsageTab";
 
-const DEPLOY_MODE: Record<string, string> = {
-  dokploy: "через Dokploy API",
-  healthcheck: "по health-адресу сайта",
-  none: "не настроено",
-};
+/**
+ * Содержимое админки вынесено отдельно, потому что монтируется только на
+ * открытой модалке: так каждая вкладка тянет состояние сервера в момент
+ * открытия, а закрытая админка не держит ни одного запроса.
+ */
+function AdminTabs({ onPausedChange }: { onPausedChange: (paused: boolean) => void }) {
+  const meta = useAdminData<MetaPayload>("/api/meta");
 
-function Row({ label, value }: { label: string; value: string }) {
   return (
-    <div className="grid grid-cols-[150px_1fr] gap-x-3 gap-y-1 text-sm">
-      <dt className="text-muted">{label}</dt>
-      <dd className="break-words">{value}</dd>
-    </div>
+    <Tabs>
+      <Tabs.ListContainer>
+        <Tabs.List aria-label="Разделы админки">
+          <Tabs.Tab id="readiness">
+            Готовность
+            <Tabs.Indicator />
+          </Tabs.Tab>
+          <Tabs.Tab id="usage">
+            Расход
+            <Tabs.Indicator />
+          </Tabs.Tab>
+          <Tabs.Tab id="people">
+            Люди
+            <Tabs.Indicator />
+          </Tabs.Tab>
+          <Tabs.Tab id="journal">
+            Журнал
+            <Tabs.Indicator />
+          </Tabs.Tab>
+          <Tabs.Tab id="settings">
+            Настройки
+            <Tabs.Indicator />
+          </Tabs.Tab>
+        </Tabs.List>
+      </Tabs.ListContainer>
+
+      <Tabs.Panel className="pt-4" id="readiness">
+        <ReadinessTab />
+      </Tabs.Panel>
+      <Tabs.Panel className="pt-4" id="usage">
+        <UsageTab />
+      </Tabs.Panel>
+      <Tabs.Panel className="pt-4" id="people">
+        <PeopleTab />
+      </Tabs.Panel>
+      <Tabs.Panel className="pt-4" id="journal">
+        <JournalTab statuses={meta.data?.statuses ?? {}} />
+      </Tabs.Panel>
+      <Tabs.Panel className="pt-4" id="settings">
+        <SettingsTab
+          error={meta.error}
+          meta={meta.data}
+          onPausedChange={(paused) => {
+            meta.setData((current) => (current ? { ...current, paused } : current));
+            // Баннер «приём приостановлен» живёт состоянием App: без этого
+            // администратор, щёлкнувший переключатель, не видел собственную
+            // паузу до переключения вкладки браузера.
+            onPausedChange(paused);
+          }}
+          onRetry={meta.reload}
+        />
+      </Tabs.Panel>
+    </Tabs>
   );
 }
 
-export function AdminModal({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) {
-  const [data, setData] = useState<AdminOverview | null>(null);
-  const [copied, setCopied] = useState("");
-
-  // Состояние тянем при каждом открытии: оно меняется (клон, токен, деплой).
-  useEffect(() => {
-    if (!isOpen) return;
-    setData(null);
-    api<AdminOverview>("/api/admin/overview")
-      .then(setData)
-      .catch((error: Error) => setData({ error: error.message }));
-  }, [isOpen]);
-
+export function AdminModal({
+  isOpen,
+  onClose,
+  onPausedChange,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  onPausedChange: (paused: boolean) => void;
+}) {
   return (
     <Modal
       isOpen={isOpen}
@@ -40,116 +90,15 @@ export function AdminModal({ isOpen, onClose }: { isOpen: boolean; onClose: () =
     >
       <Modal.Backdrop>
         <Modal.Container>
-          <Modal.Dialog className="sm:max-w-[640px]">
+          <Modal.Dialog className="sm:max-w-[860px]">
             <Modal.CloseTrigger />
             <Modal.Header>
               <Modal.Heading>Админка</Modal.Heading>
             </Modal.Header>
-            <Modal.Body className="flex flex-col gap-4">
-              {!data ? (
-                <div className="text-muted flex items-center gap-2 text-sm">
-                  <Spinner className="size-4" /> Загружаю состояние…
-                </div>
-              ) : null}
-
-              {data?.error ? (
-                <Alert status="danger">
-                  <Alert.Indicator />
-                  <Alert.Content>
-                    <Alert.Title>Не удалось получить состояние</Alert.Title>
-                    <Alert.Description>{data.error}</Alert.Description>
-                  </Alert.Content>
-                </Alert>
-              ) : null}
-
-              {data?.config_problems?.length ? (
-                <Alert status="danger">
-                  <Alert.Indicator />
-                  <Alert.Content>
-                    <Alert.Title>Не хватает настроек</Alert.Title>
-                    <Alert.Description>
-                      <ul className="list-inside list-disc">
-                        {data.config_problems.map((problem) => (
-                          <li key={problem}>{problem}</li>
-                        ))}
-                      </ul>
-                    </Alert.Description>
-                  </Alert.Content>
-                </Alert>
-              ) : null}
-
-              {data && !data.error ? (
-                <dl className="flex flex-col gap-1.5">
-                  <Row
-                    label="Репозиторий"
-                    value={
-                      data.github?.ok
-                        ? `${data.github.repo} (${data.github.can_push ? "есть право записи" : "НЕТ права записи"})`
-                        : (data.github?.error ?? "—")
-                    }
-                  />
-                  <Row
-                    label="Основная ветка"
-                    value={
-                      data.repo?.ok
-                        ? `${data.repo.base} · ${data.repo.head} · ${data.repo.last_commit}`
-                        : (data.repo?.error ?? "—")
-                    }
-                  />
-                  <Row
-                    label="Песочница агента"
-                    value={
-                      data.sandbox
-                        ? `${data.sandbox.mode}, сеть ${data.sandbox.network ? "включена" : "выключена"}, модель ${data.sandbox.model}`
-                        : "—"
-                    }
-                  />
-                  <Row
-                    label="Слежение за выкаткой"
-                    value={DEPLOY_MODE[data.deploy_mode ?? "none"] ?? "—"}
-                  />
-                  <Row
-                    label="Параллельных заявок"
-                    value={String(data.runtime?.max_concurrent ?? "—")}
-                  />
-                  <Row
-                    label="Локальная копия"
-                    value={
-                      data.runtime?.repo_ready ? "готова" : data.runtime?.repo_error || "готовится"
-                    }
-                  />
-                </dl>
-              ) : null}
-
-              {data?.access_links?.length ? (
-                <>
-                  <Separator />
-                  <div className="flex flex-col gap-2">
-                    <h3 className="text-muted text-xs font-semibold tracking-wider uppercase">
-                      Персональные ссылки
-                    </h3>
-                    {data.access_links.map((person) => (
-                      <div key={person.login} className="flex items-center gap-2 text-sm">
-                        <span className="w-32 flex-none truncate">
-                          {person.display_name}
-                          {person.role === "admin" ? " (админ)" : ""}
-                        </span>
-                        <code className="text-muted flex-1 truncate text-xs">{person.link}</code>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onPress={() => {
-                            void navigator.clipboard.writeText(person.link);
-                            setCopied(person.login);
-                          }}
-                        >
-                          {copied === person.login ? "Скопировано" : "Копировать"}
-                        </Button>
-                      </div>
-                    ))}
-                  </div>
-                </>
-              ) : null}
+            {/* Высоту держим руками, иначе модалка прыгает при переключении вкладок.
+                На низком экране запас меньше: тело модалки и так прокручивается. */}
+            <Modal.Body className="min-h-[240px] sm:min-h-[380px]">
+              {isOpen ? <AdminTabs onPausedChange={onPausedChange} /> : null}
             </Modal.Body>
           </Modal.Dialog>
         </Modal.Container>

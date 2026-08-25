@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button, Spinner, toast } from "@heroui/react";
 import { fetchImage, uploadImage } from "../api";
-
-export const MAX_IMAGES = 4;
+import { maxImages } from "../status";
 
 interface Attachment {
   key: string;
@@ -24,14 +23,15 @@ export function useAttachments() {
     if (!pictures.length) return;
 
     setItems((current) => {
-      const room = MAX_IMAGES - current.length;
+      const limit = maxImages();
+      const room = limit - current.length;
       if (room <= 0) {
-        toast.warning(`К одному сообщению можно приложить не больше ${MAX_IMAGES} картинок`);
+        toast.warning(`К одному сообщению можно приложить не больше ${limit} картинок`);
         return current;
       }
       const accepted = pictures.slice(0, room);
       if (accepted.length < pictures.length) {
-        toast.warning(`Взял только ${accepted.length}: больше ${MAX_IMAGES} картинок нельзя`);
+        toast.warning(`Взял только ${accepted.length}: больше ${limit} картинок нельзя`);
       }
       const fresh = accepted.map((file) => {
         const key = `img-${(counter.current += 1)}`;

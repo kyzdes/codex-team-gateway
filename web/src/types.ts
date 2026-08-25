@@ -4,6 +4,14 @@ export interface TextChange {
   after: string;
 }
 
+/** Расход модели по заявке; складывается на сервере за все прогоны агента. */
+export interface Usage {
+  input_tokens?: number;
+  cached_input_tokens?: number;
+  output_tokens?: number;
+  turns?: number;
+}
+
 export interface RequestItem {
   id: number;
   user: string;
@@ -24,6 +32,9 @@ export interface RequestItem {
   files: string[];
   text_changes: TextChange[];
   images: string[];
+  usage?: Usage;
+  approved_by?: string | null;
+  approved_at?: string | null;
   error?: string | null;
   created_at: string;
   updated_at: string;
@@ -46,15 +57,85 @@ export interface Me {
   project: { site: string; repo: string };
 }
 
-export interface AdminOverview {
-  error?: string;
-  config_problems?: string[];
-  repo?: { ok: boolean; base?: string; head?: string; last_commit?: string; error?: string };
-  github?: { ok: boolean; repo?: string; can_push?: boolean; error?: string };
-  deploy_mode?: string;
-  sandbox?: { mode: string; network: boolean; model: string };
-  access_links?: { login: string; display_name: string; role: string; link: string }[];
-  runtime?: { repo_ready: boolean; repo_error: string; max_concurrent: number };
+/** Набор оттенков совпадает с палитрой чипов HeroUI. */
+export type StatusTone = "default" | "accent" | "success" | "warning" | "danger";
+
+export interface StatusMetaPayload {
+  label: string;
+  tone: StatusTone;
+  /** Индекс шага в шкале steps; -1 — путь прерван. */
+  step: number;
+  busy?: boolean;
+}
+
+/** Ответ /api/meta: подписи статусов и ограничения инстанса. */
+export interface MetaPayload {
+  statuses: Record<string, StatusMetaPayload>;
+  steps: string[];
+  limits: { max_images: number; rate_limit_per_hour: number };
+  approval_policy: string;
+  paused: boolean;
+}
+
+/** Пункт чек-листа готовности инстанса (/api/admin/readiness). */
+export interface ReadinessCheck {
+  key: string;
+  title: string;
+  ok: boolean;
+  detail: string;
+  hint: string;
+}
+
+export interface ReadinessResponse {
+  checks: ReadinessCheck[];
+  /** Ошибки в переменных окружения самого шлюза — их не видит ни одна проверка выше. */
+  problems: string[];
+}
+
+/** Строка расхода токенов по человеку (/api/admin/usage). */
+export interface UsageRow {
+  user: string;
+  /** Человеческое имя; у людей, удалённых до появления таблицы people, его нет. */
+  author?: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+}
+
+export interface UsageResponse {
+  totals: UsageRow[];
+  days: number;
+}
+
+/** Запись журнала подтверждений выкатки (/api/admin/journal). */
+export interface JournalEntry {
+  id: number;
+  title: string;
+  user: string;
+  /** Имена вместо логинов: журнал читают люди, а не машины. */
+  author?: string;
+  approver?: string;
+  approved_by: string;
+  approved_at: string;
+  pr_url?: string | null;
+  status: string;
+}
+
+export interface JournalResponse {
+  entries: JournalEntry[];
+}
+
+/** Человек из таблицы people (/api/admin/people). */
+export interface Person {
+  login: string;
+  display_name: string;
+  role: string;
+  disabled: boolean;
+  link: string;
+}
+
+export interface PeopleResponse {
+  people: Person[];
 }
 
 export type StreamPayload =

@@ -4,34 +4,64 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from pathlib import Path
+import logging
+import os
+from collections import deque
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, AsyncIterator, Awaitable, Callable
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+import httpx
+from fastapi import (
+    Cookie,
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, bus, db, deploy, github, gitops, pipeline, uploads
+from . import auth, bus, codex_runner, db, deploy, github, gitops, pipeline, uploads
 from .config import settings
+
+logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
+# Вход по ссылке ?k=… обменивается на HttpOnly-cookie: иначе токен остаётся
+# в истории браузера, в закладках и в заголовке Referer у любой внешней ссылки.
+SESSION_COOKIE = "gw_session"
+SESSION_MAX_AGE = 90 * 24 * 3600
+
+GITHUB_API = "https://api.github.com"
+PROBE_TIMEOUT = 20
+
 
 @asynccontextmanager
-async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     db.connect()
+    # Люди живут в базе, поэтому завести их можно только после connect().
+    auth.seed_people()
     await pipeline.recover_after_restart()
-    application.state.repo_ready = False
-    application.state.repo_error = ""
 
     async def warm_repo() -> None:
+        """Клон проекта занимает минуты — тянем его в фоне, чтобы старт не ждал.
+
+        Упавший клон сервис не роняет: администратор увидит это пунктом
+        «Локальная копия проекта» в чек-листе готовности.
+        """
         try:
             await gitops.ensure_repo()
-            application.state.repo_ready = True
-        except Exception as exc:  # noqa: BLE001 — покажем в админке, но сервис не уроним
-            application.state.repo_error = str(exc)
+        except Exception as exc:  # noqa: BLE001 — сервис поднимается и без копии
+            logger.warning("Копия проекта не подготовилась: %s", exc)
 
     tasks = [asyncio.create_task(pipeline.checks_watcher()), asyncio.create_task(warm_repo())]
     try:
@@ -65,11 +95,17 @@ class Principal(BaseModel):
 
 def current_user(
     authorization: str | None = Header(None),
+    session: str | None = Cookie(None, alias=SESSION_COOKIE),
     k: str | None = Query(None, description="токен из персональной ссылки"),
 ) -> Principal:
-    token = k
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.removeprefix("Bearer ").strip()
+    # Пустой Authorization (браузер уже перешёл на cookie, а фронт по привычке
+    # шлёт «Bearer ») не должен перекрывать cookie — поэтому не первый
+    # непустой источник, а именно первый непустой ТОКЕН.
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[len("bearer ") :].strip()
+    token = token or (session or "").strip() or (k or "").strip()
+
     found = auth.resolve(token)
     if not found:
         raise HTTPException(status_code=401, detail="Ссылка недействительна. Попросите новую у администратора.")
@@ -77,11 +113,73 @@ def current_user(
     return Principal(login=login, display_name=profile.get("display_name", login), role=profile.get("role", "user"))
 
 
+def admin_only(user: Principal = Depends(current_user)) -> Principal:
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Только для администратора")
+    return user
+
+
 def owned(request_id: int, user: Principal) -> dict[str, Any]:
     request = db.get_request(request_id)
     if not request or (request["user"] != user.login and not user.is_admin):
         raise HTTPException(status_code=404, detail="Заявка не найдена")
     return request
+
+
+def forwarded_scheme(request: Request) -> str:
+    """Схема с точки зрения браузера, а не контейнера.
+
+    За TLS-терминатором (Dokploy, Traefik) в scope всегда http: uvicorn
+    запущен без --proxy-headers, да и доверять им можно только заголовку
+    прокси. Без этого персональная ссылка уезжала бы человеку по голому http
+    вместе с живым токеном доступа.
+    """
+    scheme = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    return scheme or request.url.scheme
+
+
+def base_url(request: Request) -> str:
+    """Адрес инстанса без хвостового слэша — из него собираются ссылки доступа."""
+    return str(request.base_url.replace(scheme=forwarded_scheme(request))).rstrip("/")
+
+
+def request_or_404(request_id: int) -> dict[str, Any]:
+    request = db.get_request(request_id)
+    if not request:
+        raise HTTPException(status_code=404, detail="Заявка не найдена")
+    return request
+
+
+def claim(request: dict[str, Any], allowed: set[str], status: str, conflict: str, **fields: Any) -> None:
+    """Занять заявку под операцию, переведя статус до запуска фоновой работы.
+
+    Обработчики живут в одном цикле событий, поэтому проверка статуса и его
+    смена без единого await между ними неделимы: второй клик по «Выкатить»
+    (или двойная отправка ответа) увидит уже новый статус и получит 409,
+    а не запустит вторую выкатку поверх первой.
+    """
+    if request["status"] not in allowed:
+        raise HTTPException(status_code=409, detail=conflict)
+    db.update_request(request["id"], status=status, **fields)
+    updated = db.get_request(request["id"])
+    if updated:
+        bus.publish({"type": "request", "request": updated})
+
+
+def enforce_rate_limit(user: Principal) -> None:
+    """Один человек не должен занять всю очередь: заявки стоят денег и времени агента."""
+    limit = settings.rate_limit_per_hour
+    if limit <= 0 or user.is_admin:
+        return
+    since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+    if db.count_requests_since(user.login, since) >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Слишком много заявок подряд. "
+                f"Предел — {limit} в час, попробуйте ещё раз через несколько минут."
+            ),
+        )
 
 
 # --- модели запросов ------------------------------------------------------
@@ -96,7 +194,18 @@ class Answer(BaseModel):
     images: list[str] = Field(default_factory=list, max_length=uploads.MAX_PER_MESSAGE)
 
 
-# --- жизненный цикл приложения -------------------------------------------
+class NewPerson(BaseModel):
+    login: str = Field(min_length=2, max_length=32)
+    display_name: str = Field(min_length=1, max_length=80)
+
+
+class DisabledFlag(BaseModel):
+    disabled: bool
+
+
+class PausedFlag(BaseModel):
+    paused: bool
+
 
 # --- API ------------------------------------------------------------------
 
@@ -118,6 +227,21 @@ async def me(user: Principal = Depends(current_user)) -> dict[str, Any]:
     }
 
 
+@app.get("/api/meta")
+async def meta(_: Principal = Depends(current_user)) -> dict[str, Any]:
+    """Подписи статусов и лимиты приходят с сервера: фронт не должен знать их наизусть."""
+    return {
+        "statuses": pipeline.STATUS_META,
+        "steps": pipeline.STEPS,
+        "limits": {
+            "max_images": uploads.MAX_PER_MESSAGE,
+            "rate_limit_per_hour": settings.rate_limit_per_hour,
+        },
+        "approval_policy": settings.approval_policy,
+        "paused": pipeline.paused(),
+    }
+
+
 @app.get("/api/requests")
 async def list_requests(user: Principal = Depends(current_user)) -> dict[str, Any]:
     rows = db.list_requests(None if user.is_admin else user.login)
@@ -128,6 +252,7 @@ async def list_requests(user: Principal = Depends(current_user)) -> dict[str, An
 
 @app.post("/api/requests", status_code=201)
 async def create_request(payload: NewRequest, user: Principal = Depends(current_user)) -> dict[str, Any]:
+    enforce_rate_limit(user)
     request_id = db.create_request(user.login, payload.body.strip())
     try:
         attached = uploads.attach(request_id, user.login, payload.images)
@@ -147,6 +272,9 @@ async def upload_image(
     file: UploadFile = File(...), user: Principal = Depends(current_user)
 ) -> dict[str, str]:
     """Картинка кладётся в личный черновик и прикрепляется при отправке заявки."""
+    # Тот же часовой предел, что и на заявки: кто не может отправить заявку,
+    # тому незачем и складывать под неё картинки в общий том.
+    enforce_rate_limit(user)
     data = await file.read(uploads.MAX_BYTES + 1)
     try:
         name = uploads.save_staged(user.login, data)
@@ -194,14 +322,15 @@ async def get_request(request_id: int, user: Principal = Depends(current_user)) 
 @app.post("/api/requests/{request_id}/answer")
 async def answer(request_id: int, payload: Answer, user: Principal = Depends(current_user)) -> dict[str, Any]:
     request = owned(request_id, user)
-    if request["status"] != pipeline.NEEDS_INPUT:
-        raise HTTPException(status_code=409, detail="Сейчас заявка не ждёт ответа")
     try:
         attached = uploads.attach(request_id, user.login, payload.images)
     except uploads.UploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if attached:
         db.update_request(request_id, images=[*(request.get("images") or []), *attached])
+    # Статус уводим из needs_input сразу: пока агент разбирает ответ, второй
+    # такой же ответ не должен запустить параллельный прогон в том же worktree.
+    claim(request, {pipeline.NEEDS_INPUT}, pipeline.QUEUED, "Сейчас заявка не ждёт ответа")
     await pipeline.emit(request_id, "user", payload.text.strip())
     pipeline.start(request_id, followup=payload.text.strip(), images=attached)
     return {"ok": True}
@@ -210,16 +339,35 @@ async def answer(request_id: int, payload: Answer, user: Principal = Depends(cur
 @app.post("/api/requests/{request_id}/approve")
 async def approve(request_id: int, user: Principal = Depends(current_user)) -> dict[str, Any]:
     request = owned(request_id, user)
-    if request["status"] != pipeline.REVIEW:
-        raise HTTPException(status_code=409, detail="Заявка ещё не готова к подтверждению")
+    if settings.approval_policy == "admin" and not user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="В этом проекте выкатку подтверждает администратор — правка уже ждёт его.",
+        )
+    claim(
+        request,
+        {pipeline.REVIEW},
+        pipeline.MERGING,
+        "Заявка ещё не готова к подтверждению",
+        approved_by=user.login,
+        approved_at=db.now(),
+    )
     await pipeline.emit(request_id, "user", f"{user.display_name} подтвердил выкатку")
-    pipeline.approve(request_id)
+    pipeline.approve(request_id, approved_by=user.login)
     return {"ok": True}
+
+
+# Отменить можно всё, что ещё не завершилось: словарь статусов пайплайна —
+# единственный источник правды по их набору.
+CANCELLABLE = set(pipeline.STATUS_META) - pipeline.FINAL
 
 
 @app.post("/api/requests/{request_id}/cancel")
 async def cancel(request_id: int, user: Principal = Depends(current_user)) -> dict[str, Any]:
-    owned(request_id, user)
+    request = owned(request_id, user)
+    # Помечаем отменённой сразу, а PR и рабочую копию пайплайн уберёт следом:
+    # для него cancelled — не «уже сделано», а «пора прибирать».
+    claim(request, CANCELLABLE, pipeline.CANCELLED, "Заявка уже завершена")
     await pipeline.cancel(request_id)
     return {"ok": True}
 
@@ -229,6 +377,13 @@ async def retry(request_id: int, user: Principal = Depends(current_user)) -> dic
     request = owned(request_id, user)
     if request["status"] in pipeline.ACTIVE:
         raise HTTPException(status_code=409, detail="Заявка уже в работе")
+    if request.get("retried_at"):
+        raise HTTPException(status_code=409, detail="Эту заявку уже отправили заново")
+    enforce_rate_limit(user)
+    # Отметка ставится до первого await: между проверкой и созданием новой
+    # заявки есть паузы, а двойная отправка формы приходит в тот же процесс —
+    # без синхронной отметки оба запроса завели бы по заявке и по прогону.
+    db.update_request(request_id, retried_at=db.now())
     if request.get("pr_number") and request["status"] not in pipeline.FINAL:
         await pipeline.cancel(request_id)
     new_id = db.create_request(request["user"], request["body"])
@@ -248,7 +403,10 @@ async def stream(request: Request, user: Principal = Depends(current_user)) -> S
         try:
             yield bus.sse({"type": "hello"})
             while True:
-                if await request.is_disconnected():
+                # Шина отписывает медленного клиента сама. Не заметив этого,
+                # мы бы вечно ждали событий в мёртвой очереди — поэтому
+                # закрываем поток, а браузер переподключится и перечитает состояние.
+                if not bus.is_subscribed(queue) or await request.is_disconnected():
                     break
                 try:
                     payload = await asyncio.wait_for(queue.get(), timeout=20)
@@ -269,38 +427,370 @@ async def stream(request: Request, user: Principal = Depends(current_user)) -> S
     )
 
 
-# --- админка --------------------------------------------------------------
+# --- админка: чек-лист готовности ----------------------------------------
 
-@app.get("/api/admin/overview")
-async def admin_overview(request: Request, user: Principal = Depends(current_user)) -> dict[str, Any]:
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="Только для администратора")
-    base = str(request.base_url).rstrip("/")
+async def github_api(path: str, params: dict[str, str] | None = None) -> tuple[int, Any]:
+    """Редкие ручки GitHub, нужные только чек-листу готовности.
 
-    async def probe(coro: Any) -> dict[str, Any]:
-        """Одна упавшая проверка не должна ронять всю админку."""
-        try:
-            return await coro
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
-
-    return {
-        "config_problems": settings.problems(),
-        "repo": await probe(gitops.repo_info()),
-        "github": await probe(github.token_check()),
-        "deploy_mode": deploy.configured(),
-        "sandbox": {
-            "mode": settings.codex_sandbox,
-            "network": settings.codex_network,
-            "model": settings.codex_model or "по умолчанию",
-        },
-        "access_links": auth.access_links(base),
-        "runtime": {
-            "repo_ready": getattr(app.state, "repo_ready", False),
-            "repo_error": getattr(app.state, "repo_error", ""),
-            "max_concurrent": settings.max_concurrent,
-        },
+    В рабочем цикле заявки они не участвуют, поэтому общему слою github.py
+    не принадлежат: там живёт ровно то, без чего заявка не доедет до сайта.
+    """
+    if not settings.github_token:
+        raise github.GitHubError("GITHUB_TOKEN не задан — проверять нечем")
+    headers = {
+        "Authorization": f"Bearer {settings.github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(f"{GITHUB_API}{path}", headers=headers, params=params)
+    try:
+        return response.status_code, response.json()
+    except ValueError:
+        return response.status_code, {"message": response.text[:300]}
+
+
+def github_message(payload: Any) -> str:
+    return str((payload or {}).get("message") or "") if isinstance(payload, dict) else ""
+
+
+async def probe_github_token() -> tuple[bool, str]:
+    data = await github.token_check()
+    if not data.get("ok"):
+        return False, str(data.get("error") or "GitHub не ответил")
+    if not data.get("can_push"):
+        return False, f"{data.get('repo')}: репозиторий виден, но записывать в него токен не может"
+    return True, f"{data.get('repo')}: чтение и запись доступны"
+
+
+async def probe_branch_protection() -> tuple[bool, str]:
+    status, payload = await github_api(
+        f"/repos/{settings.repo}/branches/{settings.base_branch}/protection"
+    )
+    if status == 404:
+        return False, f"ветка {settings.base_branch} ничем не защищена"
+    if status >= 400:
+        return False, f"GitHub {status}: {github_message(payload)}"
+    contexts = ((payload or {}).get("required_status_checks") or {}).get("contexts") or []
+    if contexts:
+        return True, f"защита включена, обязательные проверки: {', '.join(contexts)}"
+    return True, "защита включена, но обязательных проверок в ней нет"
+
+
+async def probe_required_check() -> tuple[bool, str]:
+    if not settings.required_check:
+        return False, "проверка не задана — правка уйдёт на подтверждение без CI"
+    status, payload = await github_api(f"/repos/{settings.repo}/actions/runs", {"per_page": "20"})
+    if status >= 400:
+        return False, f"GitHub {status}: {github_message(payload)}"
+    runs = (payload or {}).get("workflow_runs") or []
+    if not runs:
+        return False, "в репозитории ещё не было ни одного прогона Actions"
+    wanted = settings.required_check.lower()
+    for run in runs:
+        haystack = f"{run.get('name') or ''} {run.get('path') or ''}".lower()
+        if wanted in haystack:
+            return True, f"«{settings.required_check}» встречается в последних прогонах"
+    names = ", ".join(sorted({str(r.get("name") or "?") for r in runs})[:5])
+    return False, f"среди последних {len(runs)} прогонов «{settings.required_check}» нет (есть: {names})"
+
+
+async def probe_agents_md() -> tuple[bool, str]:
+    if not (settings.repo_dir / ".git").exists():
+        return False, "локальной копии проекта ещё нет — проверять нечего"
+    path = settings.repo_dir / "AGENTS.md"
+    if not path.is_file():
+        return False, "в корне проекта нет AGENTS.md"
+    return True, f"AGENTS.md на месте, {path.stat().st_size} байт"
+
+
+async def probe_run(argv: list[str]) -> tuple[int | None, str]:
+    """Короткая диагностическая команда от имени агента: (код возврата, вывод).
+
+    None вместо кода — команда не ответила вовремя. Своя группа процессов тут
+    не роскошь: под sudo процесс чужой, прямой kill по нему не проходит, и без
+    группового сигнала зависшая проверка подвесила бы всю вкладку «Готовность».
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *codex_runner.agent_command(argv),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=codex_runner.clean_env(),
+        start_new_session=True,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=PROBE_TIMEOUT)
+    except asyncio.TimeoutError:
+        await codex_runner.kill_group(proc)
+        return None, ""
+    return proc.returncode, out.decode("utf-8", errors="replace").strip()
+
+
+async def probe_codex_login() -> tuple[bool, str]:
+    """Без авторизации Codex падает каждая заявка, а видно это только в логе агента."""
+    code, text = await probe_run([settings.codex_bin, "login", "status"])
+    if code is None:
+        return False, "codex login status не ответил за отведённое время"
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if code == 0:
+        return True, first or "авторизация есть"
+    return False, first or f"codex завершился с кодом {code}"
+
+
+async def probe_agent_isolation() -> tuple[bool, str]:
+    """Работает ли агент отдельным пользователем — главный предохранитель шлюза.
+
+    Верим не настройке, а прогону: правило sudoers могло не примениться, а
+    обёртка — не доехать в образ. При совпадающем uid очистка окружения не
+    защищает ничего: дочерний процесс читает /proc/<pid шлюза>/environ и
+    забирает оттуда GitHub-токен и токены доступа обратно.
+    """
+    ready, reason = codex_runner.isolation()
+    if not ready:
+        return False, reason
+    code, text = await probe_run(["id", "-u"])
+    if code is None:
+        return False, "обёртка запуска от имени агента не ответила"
+    if code != 0 or not text.isdigit():
+        return False, f"обёртка не отработала: {text[:200] or f'код возврата {code}'}"
+    if int(text) == os.geteuid():
+        return False, "прогон идёт тем же пользователем, что и шлюз"
+    return True, f"{reason} (uid {text})"
+
+
+async def probe_repo_clone() -> tuple[bool, str]:
+    info = await gitops.repo_info()
+    if not info.get("ok"):
+        return False, str(info.get("error") or "копия проекта не готова")
+    return True, f"{info.get('base')} на {info.get('head')} — {info.get('last_commit')}"
+
+
+async def probe_deploy_tracking() -> tuple[bool, str]:
+    mode = deploy.configured()
+    if mode == "dokploy":
+        return True, "статус сборки берём из Dokploy"
+    if mode == "healthcheck":
+        return True, f"следим за адресом {settings.health_url}"
+    return False, "выкатка не отслеживается — заявка закроется сразу после мержа"
+
+
+async def readiness_check(
+    key: str, title: str, hint: str, probe: Callable[[], Awaitable[tuple[bool, str]]]
+) -> dict[str, Any]:
+    try:
+        ok, detail = await probe()
+    except github.GitHubError as exc:
+        ok, detail = False, str(exc)
+    except Exception as exc:  # noqa: BLE001 — красный пункт полезнее упавшей админки
+        ok, detail = False, f"{exc.__class__.__name__}: {exc}"
+    return {"key": key, "title": title, "ok": ok, "detail": detail, "hint": hint}
+
+
+@app.get("/api/admin/readiness")
+async def admin_readiness(_: Principal = Depends(admin_only)) -> dict[str, Any]:
+    """Всё, что должно быть настроено, чтобы первая же заявка доехала до сайта."""
+    plan = [
+        (
+            "github_token",
+            "Доступ к GitHub",
+            "Fine-grained PAT на этот репозиторий: Contents — Read and write, Pull requests — Read and write.",
+            probe_github_token,
+        ),
+        (
+            "branch_protection",
+            f"Защита ветки {settings.base_branch}",
+            f"GitHub → Settings → Branches → правило для {settings.base_branch}. "
+            "Без него сломанная проверка не помешает влить правку.",
+            probe_branch_protection,
+        ),
+        (
+            "required_check",
+            f"Обязательная проверка «{settings.required_check}»" if settings.required_check
+            else "Обязательная проверка в CI",
+            "GITHUB_REQUIRED_CHECK должен совпадать с именем workflow или job в GitHub Actions.",
+            probe_required_check,
+        ),
+        (
+            "agents_md",
+            "AGENTS.md в проекте",
+            "Положите AGENTS.md в корень репозитория: агент читает его первым и узнаёт, чего трогать нельзя.",
+            probe_agents_md,
+        ),
+        (
+            "codex_login",
+            "Codex авторизован",
+            "Выполните в контейнере `codex login --device-auth` под пользователем агента или задайте CODEX_API_KEY.",
+            probe_codex_login,
+        ),
+        (
+            "agent_isolation",
+            "Агент работает отдельным пользователем",
+            "AGENT_USER, правило в /etc/sudoers.d и обёртка /usr/local/bin/run-agent.sh. "
+            "Без них код проекта выполняется с секретами шлюза в окружении.",
+            probe_agent_isolation,
+        ),
+        (
+            "repo_clone",
+            "Локальная копия проекта",
+            "Копия появляется сама при старте. Если её нет — смотрите PROJECT_REPO и доступ к GitHub.",
+            probe_repo_clone,
+        ),
+        (
+            "deploy_tracking",
+            "Отслеживание выкатки",
+            "Заполните DOKPLOY_URL/TOKEN/APPLICATION_ID или хотя бы PROJECT_PROD_URL с health-адресом.",
+            probe_deploy_tracking,
+        ),
+    ]
+    checks = await asyncio.gather(*(readiness_check(*item) for item in plan))
+    # Опечатка в переменной окружения не ловится ни одной проверкой выше:
+    # там смотрят на внешний мир, а тут — на то, с чем запустился сам шлюз.
+    return {"checks": list(checks), "problems": settings.problems()}
+
+
+# --- админка: расход и журнал --------------------------------------------
+
+@app.get("/api/admin/usage")
+async def admin_usage(
+    days: int = Query(30, ge=1, le=365), _: Principal = Depends(admin_only)
+) -> dict[str, Any]:
+    totals = db.usage_totals(days)
+    for row in totals:
+        row["author"] = auth.display_name(row.get("user", ""))
+    return {"totals": totals, "days": days}
+
+
+@app.get("/api/admin/journal")
+async def admin_journal(
+    limit: int = Query(50, ge=1, le=500), _: Principal = Depends(admin_only)
+) -> dict[str, Any]:
+    entries = db.approvals_journal(limit)
+    for row in entries:
+        row["author"] = auth.display_name(row.get("user", ""))
+        row["approver"] = auth.display_name(row["approved_by"]) if row.get("approved_by") else ""
+    return {"entries": entries}
+
+
+# --- админка: люди --------------------------------------------------------
+
+def known_person(login: str) -> dict[str, Any]:
+    person = db.get_person(login)
+    if not person:
+        raise HTTPException(status_code=404, detail="Человек не найден")
+    return person
+
+
+@app.get("/api/admin/people")
+async def admin_people(request: Request, _: Principal = Depends(admin_only)) -> dict[str, Any]:
+    return {"people": auth.access_links(base_url(request))}
+
+
+@app.post("/api/admin/people", status_code=201)
+async def admin_add_person(
+    payload: NewPerson, request: Request, _: Principal = Depends(admin_only)
+) -> dict[str, Any]:
+    try:
+        person = auth.add_person(payload.login, payload.display_name)
+    except auth.PeopleError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Логин берём из ответа, а не из запроса: add_person приводит его к нижнему
+    # регистру, и «Anna» из формы завелась бы как «anna» — искать её обратно
+    # по исходной строке значит не найти только что созданного человека.
+    return auth.access_link(base_url(request), person["login"])
+
+
+@app.post("/api/admin/people/{login}/disable")
+async def admin_disable_person(
+    login: str, payload: DisabledFlag, request: Request, _: Principal = Depends(admin_only)
+) -> dict[str, Any]:
+    known_person(login)
+    try:
+        if payload.disabled:
+            auth.disable_person(login)
+        else:
+            auth.enable_person(login)
+    except auth.PeopleError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return auth.access_link(base_url(request), login)
+
+
+@app.post("/api/admin/people/{login}/rotate")
+async def admin_rotate_person(
+    login: str, request: Request, _: Principal = Depends(admin_only)
+) -> dict[str, str]:
+    """Старая ссылка перестаёт работать сразу — этим и забирают доступ."""
+    known_person(login)
+    try:
+        token = auth.rotate_token(login)
+    except auth.PeopleError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"link": f"{base_url(request)}/?k={token}"}
+
+
+# --- админка: приём заявок и разбор конкретной заявки ---------------------
+
+@app.post("/api/admin/pause")
+async def admin_pause(payload: PausedFlag, _: Principal = Depends(admin_only)) -> dict[str, Any]:
+    db.set_setting("intake_paused", "1" if payload.paused else "0")
+    if not payload.paused:
+        # Пока стояла пауза, заявки копились в очереди — теперь их пора разобрать.
+        pipeline.resume_queued()
+    return {"paused": pipeline.paused()}
+
+
+def attempt_number(path: Path) -> int:
+    """req-12-3.jsonl → 3: попытки нумеруются по порядку, нужен последний прогон."""
+    suffix = path.stem.rsplit("-", 1)[-1]
+    return int(suffix) if suffix.isdigit() else 0
+
+
+def read_log_tail(request_id: int, tail: int) -> list[str]:
+    """Хвост последнего прогона агента. Файл читаем потоком: он бывает в десятки мегабайт."""
+    logs = sorted(settings.logs_dir.glob(f"req-{request_id}-*.jsonl"), key=attempt_number)
+    if not logs:
+        return []
+    with logs[-1].open("r", encoding="utf-8", errors="replace") as handle:
+        return [line.rstrip("\n") for line in deque(handle, maxlen=tail)]
+
+
+@app.get("/api/admin/requests/{request_id}/log")
+async def admin_request_log(
+    request_id: int, tail: int = Query(200, ge=1, le=5000), _: Principal = Depends(admin_only)
+) -> dict[str, Any]:
+    request_or_404(request_id)
+    return {"lines": await asyncio.to_thread(read_log_tail, request_id, tail)}
+
+
+@app.get("/api/admin/requests/{request_id}/tests")
+async def admin_request_tests(request_id: int, _: Principal = Depends(admin_only)) -> dict[str, str]:
+    return {"output": request_or_404(request_id).get("tests_output") or ""}
+
+
+@app.post("/api/admin/requests/{request_id}/force-cancel")
+async def admin_force_cancel(request_id: int, _: Principal = Depends(admin_only)) -> dict[str, Any]:
+    request_or_404(request_id)
+    await pipeline.force_cancel(request_id)
+    return {"ok": True}
+
+
+@app.post("/api/admin/requests/{request_id}/recheck")
+async def admin_recheck(request_id: int, _: Principal = Depends(admin_only)) -> dict[str, Any]:
+    """Опрос проверок GitHub вне очереди: сторож ходит раз в 20 секунд, а ждать не хочется."""
+    request = request_or_404(request_id)
+    if not request.get("pr_number"):
+        raise HTTPException(status_code=409, detail="У заявки ещё нет PR — проверять нечего")
+    if request["status"] not in pipeline.RECHECKABLE:
+        # Иначе кнопка воскрешала бы завершённую заявку: refresh_checks увёл бы
+        # её обратно в review, человек увидел бы «Выкатить» на уже смерженном
+        # PR, а GitHub ответил бы на это 405.
+        raise HTTPException(
+            status_code=409, detail="Заявка уже прошла этот этап — проверять нечего"
+        )
+    # Переходы статусов по результату проверки живут в пайплайне — дублировать
+    # их здесь нельзя, иначе сторож и кнопка начнут расходиться.
+    await pipeline.refresh_checks(request)
+    return {"ok": True}
 
 
 @app.get("/api/health-check")
@@ -314,5 +804,22 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/")
-async def index() -> FileResponse:
+async def index(request: Request, k: str | None = Query(None)) -> Response:
+    """Персональная ссылка ?k=… обменивается на cookie и тут же исчезает из адреса.
+
+    Иначе токен остаётся в истории браузера, в закладках и в Referer — а это
+    та самая ссылка, по которой любой войдёт под этим человеком.
+    """
+    if k and auth.resolve(k):
+        response: Response = RedirectResponse("/", status_code=303)
+        response.set_cookie(
+            SESSION_COOKIE,
+            k,
+            max_age=SESSION_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+            secure=forwarded_scheme(request) == "https",
+            path="/",
+        )
+        return response
     return FileResponse(str(STATIC_DIR / "index.html"))

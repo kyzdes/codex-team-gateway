@@ -10,12 +10,14 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 WORK = Path(tempfile.mkdtemp(prefix="gateway-e2e-"))
@@ -39,6 +41,7 @@ os.environ.update(
         "AGENT_USER": "",
         "CODEX_TIMEOUT": "120",
         "PROJECT_PROD_URL": "",
+        "RATE_LIMIT_PER_HOUR": "3",
     }
 )
 sys.path.insert(0, str(ROOT))
@@ -60,6 +63,10 @@ emit({"type": "thread.started", "thread_id": thread})
 emit({"type": "turn.started"})
 emit({"type": "item.completed", "item": {"id": "i0", "type": "command_execution",
       "command": "/bin/bash -lc 'rg -n phone index.html'", "exit_code": 0, "status": "completed"}})
+
+if "СЛОМАЙ" in prompt:
+    print("codex: не смог разобраться с проектом", file=sys.stderr)
+    raise SystemExit(3)
 
 if "ВОПРОС" in prompt and not resume:
     emit({"type": "item.completed", "item": {"id": "i1", "type": "agent_message",
@@ -109,6 +116,18 @@ def prepare() -> None:
     sh("git", "push", "-q", "origin", "main", cwd=SEED)
 
 
+async def drain(pipeline: Any) -> None:
+    """Дождаться фоновых задач пайплайна.
+
+    start() и approve() по контракту ничего не ждут — они ставят работу в цикл
+    событий и сразу возвращают управление интерфейсу. Тесту, наоборот, нужен
+    результат, поэтому досматриваем задачи до конца.
+    """
+    while pipeline._tasks:
+        await asyncio.gather(*list(pipeline._tasks))
+        await asyncio.sleep(0)  # даём отработать колбэкам, снимающим задачи с учёта
+
+
 def check(condition: bool, label: str) -> None:
     print(f"  {'✓' if condition else '✗'} {label}")
     if not condition:
@@ -117,7 +136,9 @@ def check(condition: bool, label: str) -> None:
 
 async def main() -> None:
     prepare()
-    from app import db, github, pipeline  # импорт только после настройки окружения
+    # Импорт только после настройки окружения: config читает его на уровне модуля.
+    from app import codex_runner, db, github, pipeline
+    from app.config import settings
 
     merged: dict[str, object] = {}
 
@@ -160,16 +181,28 @@ async def main() -> None:
         return {"status": "success", "detail": "", "url": ""}
 
     github.check_state = fake_check_state  # type: ignore[assignment]
-    await pipeline._refresh_checks(db.get_request(rid))
+    await pipeline.refresh_checks(db.get_request(rid))
     check(db.get_request(rid)["status"] == pipeline.REVIEW, "статус — «ждёт подтверждения»")
 
     print("\n5. Подтверждение и выкатка")
-    await pipeline._approve(rid)
+    pipeline.approve(rid, approved_by="admin")
+    await drain(pipeline)
     request = db.get_request(rid)
     check(merged.get("merged") == 42, "мерж вызван")
     check(request["status"] == pipeline.DONE, f"статус — «готово» (получено: {request['status']})")
     check(bool(request["merged_at"]) and bool(request["deployed_at"]), "проставлены отметки времени")
     check(not pipeline.gitops.worktree_path(rid).exists(), "рабочая папка убрана за собой")
+    check(request["approved_by"] == "admin", "записано, кто нажал «Выкатить»")
+    check(bool(request["approved_at"]), "записано, когда подтвердили")
+    journal = db.approvals_journal(10)
+    check(any(entry["id"] == rid for entry in journal), "выкатка попала в журнал подтверждений")
+
+    print("\n5а. Расход агента посчитан")
+    spent = request["usage"]
+    # Заявка прошла два прогона: вопрос и правку после ответа.
+    check(spent.get("turns") == 2, f"считаны оба прогона (получено: {spent.get('turns')})")
+    check(spent.get("input_tokens") == 30, f"токены сложены (получено: {spent.get('input_tokens')})")
+    check(not codex_runner.RUNNING, "живых процессов агента не осталось")
 
     print("\n6. Лента событий для человека")
     events = db.list_events(rid)
@@ -203,6 +236,230 @@ async def main() -> None:
     await pipeline._process(rid2, None)
     await pipeline._process(rid2, None)  # второй прогон: правка уже на месте
     check(db.get_request(rid2)["status"] in {pipeline.CHECKING, pipeline.NO_CHANGES}, "повторный прогон не падает")
+
+    print("\n9. Пауза приёма: агента не запускаем")
+    db.set_setting("intake_paused", "1")
+    check(pipeline.paused(), "пауза видна пайплайну")
+    rid4 = db.create_request("anna", "Поправьте телефон, пока приём закрыт")
+    pipeline.start(rid4)
+    await drain(pipeline)
+    held = db.get_request(rid4)
+    check(held["status"] == pipeline.QUEUED, f"заявка ждёт в очереди (получено: {held['status']})")
+    check(not pipeline.gitops.worktree_path(rid4).exists(), "рабочая копия не создавалась")
+    check(held["usage"] == {}, "агент не запускался — расход нулевой")
+    check(
+        any("приостановлен" in event["text"] for event in db.list_events(rid4)),
+        "человеку сказали, почему заявка стоит",
+    )
+
+    db.set_setting("intake_paused", "0")
+    check(pipeline.resume_queued() == 1, "снятие паузы подняло ровно одну ждавшую заявку")
+    # Заявка ещё числится в очереди — прогон только поставлен в цикл событий.
+    # Второй запуск дал бы ей второго агента в той же рабочей копии.
+    check(pipeline.resume_queued() == 0, "повторное снятие паузы не запускает ту же заявку дважды")
+    await drain(pipeline)
+    resumed = db.get_request(rid4)
+    check(resumed["status"] == pipeline.CHECKING, f"заявка доехала до PR (получено: {resumed['status']})")
+
+    print("\n10. Лимит заявок в час")
+    # Импорт HTTP-слоя здесь и проверяет, что он вообще собирается на этих модулях.
+    from app import main as api
+
+    limit = settings.rate_limit_per_hour
+    worker = api.Principal(login="rate-test", display_name="Проверка лимита", role="user")
+    for _ in range(limit):
+        db.create_request(worker.login, "Заявка в пределах лимита")
+    try:
+        api.enforce_rate_limit(worker)
+        check(False, "лимит отдаёт отказ")
+    except api.HTTPException as exc:
+        check(exc.status_code == 429, f"лимит отдаёт 429 (получено: {exc.status_code})")
+        check("час" in exc.detail, "в отказе объяснено, что предел часовой")
+    boss = api.Principal(login="admin", display_name="Администратор", role="admin")
+    for _ in range(limit + 1):
+        db.create_request(boss.login, "Админская заявка")
+    api.enforce_rate_limit(boss)
+    check(True, "администратора лимит не касается")
+
+    print("\n11. Маршруты API на месте")
+    paths = {getattr(route, "path", "") for route in api.app.routes}
+    for path in (
+        "/api/meta",
+        "/api/admin/readiness",
+        "/api/admin/usage",
+        "/api/admin/journal",
+        "/api/admin/people",
+        "/api/admin/people/{login}/disable",
+        "/api/admin/people/{login}/rotate",
+        "/api/admin/pause",
+        "/api/admin/requests/{request_id}/log",
+        "/api/admin/requests/{request_id}/tests",
+        "/api/admin/requests/{request_id}/force-cancel",
+        "/api/admin/requests/{request_id}/recheck",
+    ):
+        check(path in paths, f"есть {path}")
+
+    print("\n12. Тесты проекта идут без секретов шлюза")
+
+    async def run_tests_with(command: str, allow_unisolated: bool = True) -> tuple[str, str]:
+        """_run_tests с временно подменённой тестовой командой клиента.
+
+        Команду задаёт клиент, а исполняется она поверх кода, который агент
+        только что правил, — поэтому проверяем и окружение процесса, и то, что
+        без отдельного пользователя агента шлюз её вовсе не запускает.
+        """
+        original = pipeline.settings
+        pipeline.settings = dataclasses.replace(
+            original, test_cmd=command, allow_unisolated_agent=allow_unisolated
+        )
+        try:
+            return await pipeline._run_tests(WORK, rid2)
+        finally:
+            pipeline.settings = original
+
+    probe = "echo GT=[$GITHUB_TOKEN] AT=[$ADMIN_TOKEN] US=[$USERS] HOME=[${HOME:+есть}]"
+    verdict, output = await run_tests_with(probe)
+    check(verdict == "ok", f"команда клиента выполнилась (получено: {verdict})")
+    check("GT=[] AT=[] US=[]" in output, f"секретов шлюза в окружении нет: {output.strip()[-120:]}")
+    check("HOME=[есть]" in output, "остальное окружение на месте")
+    verdict, _ = await run_tests_with("exit 1")
+    check(verdict == "failed", "падение тестовой команды шлюз замечает")
+    # AGENT_USER здесь пуст, то есть агент работает тем же пользователем, что и
+    # шлюз: код проекта в таком режиме запускать нельзя — он прочитает секреты
+    # шлюза прямо из /proc, сколько окружение ни чисти.
+    marker = WORK / "должно-остаться-неисполненным"
+    verdict, _ = await run_tests_with(f"touch {marker}", allow_unisolated=False)
+    check(verdict == "skipped", f"без изоляции агента команду клиента не запускаем (получено: {verdict})")
+    check(not marker.exists(), "команда клиента действительно не выполнялась")
+
+    print("\n13. Упавшая заявка убирает за собой")
+    rid5 = db.create_request("anna", "СЛОМАЙ: пусть агент свалится")
+    pipeline.start(rid5)
+    await drain(pipeline)
+    broken = db.get_request(rid5)
+    check(broken["status"] == pipeline.FAILED, f"статус — «ошибка» (получено: {broken['status']})")
+    check(not pipeline.gitops.worktree_path(rid5).exists(), "рабочая папка убрана и после падения")
+    check(bool(broken["error"]), "человеку записано, что именно случилось")
+    check(not codex_runner.RUNNING, "процесс упавшего прогона снят с учёта")
+
+    print("\n14. Лента не умирает молча на отставшем клиенте")
+    from app import bus
+
+    queue = bus.subscribe()
+    check(bus.is_subscribed(queue), "подписка живая")
+    for number in range(bus.QUEUE_LIMIT + 5):
+        bus.publish({"type": "event", "text": f"событие {number}"})
+    # Раньше отписка была односторонней: генератор в main.py её не замечал и
+    # вечно ждал на queue.get(), а лента у человека просто замирала.
+    check(not bus.is_subscribed(queue), "переполнившего очередь клиента отписали")
+    check(queue.empty(), "накопленное выброшено — генератор выйдет сразу, а не после протухшего хвоста")
+
+    print("\n15. Завершённую заявку не воскресить проверками")
+    settled = db.get_request(rid)
+    await pipeline.refresh_checks(settled)
+    check(db.get_request(rid)["status"] == pipeline.DONE, "«Проверить заново» не вернуло готовую заявку в review")
+    try:
+        await api.admin_recheck(rid)
+        check(False, "админка отбивает проверку завершённой заявки")
+    except api.HTTPException as exc:
+        check(exc.status_code == 409, f"кнопка отдаёт 409 (получено: {exc.status_code})")
+
+    print("\n16. Выкатка не идёт по второму кругу")
+    # Сторож мог увидеть смерженный PR уже после выкатки кнопкой: снимок у него
+    # старый, а хвост общий — и второй заход переписал бы отметки и статус.
+    stale = {**settled, "status": pipeline.REVIEW}
+    await pipeline._after_merge(rid, stale)
+    again = db.get_request(rid)
+    check(again["status"] == pipeline.DONE, f"статус остался «готово» (получено: {again['status']})")
+    check(again["merged_at"] == settled["merged_at"], "отметка о мерже не переписана")
+
+    print("\n17. Повтор заявки — один раз на заявку")
+    first = await api.retry(rid5, boss)
+    check(first["id"] != rid5, "повтор завёл новую заявку")
+    check(bool(db.get_request(rid5)["retried_at"]), "исходная заявка помечена повторённой")
+    try:
+        await api.retry(rid5, boss)
+        check(False, "второй повтор отбит")
+    except api.HTTPException as exc:
+        check(exc.status_code == 409, f"второй повтор отдаёт 409 (получено: {exc.status_code})")
+    await drain(pipeline)
+
+    print("\n18. Красная проверка убирает рабочую копию")
+
+    async def fake_failed_state(sha: str) -> dict[str, str]:
+        return {"status": "failure", "detail": "job «tests» упал", "url": ""}
+
+    github.check_state = fake_failed_state  # type: ignore[assignment]
+    check(pipeline.gitops.worktree_path(rid4).exists(), "рабочая копия заявки на месте")
+    await pipeline.refresh_checks(db.get_request(rid4))
+    red = db.get_request(rid4)
+    check(red["status"] == pipeline.TESTS_FAILED, f"статус — «проверка не прошла» (получено: {red['status']})")
+    check(not pipeline.gitops.worktree_path(rid4).exists(), "рабочая копия снята и после красной проверки")
+
+    print("\n19. Картинки живой заявки переживают уборку по сроку")
+    alive = db.create_request("anna", "Заявка ждёт ответа, скриншот ещё нужен")
+    kept = uploads.attach(alive, "anna", [uploads.save_staged("anna", png)])
+    db.update_request(alive, images=kept, status=pipeline.NEEDS_INPUT)
+    folder = uploads.request_dir(alive)
+    os.utime(folder, (0, 0))
+    for item in folder.iterdir():
+        os.utime(item, (0, 0))
+    check(uploads.purge_old(1, pipeline._moving_requests()) == 0, "папку незавершённой заявки не тронули")
+    check(db.get_request(alive)["images"] == kept, "список картинок в базе цел")
+    db.update_request(alive, status=pipeline.DONE)
+    check(uploads.purge_old(1, pipeline._moving_requests()) == 1, "папку завершённой заявки убрали")
+    check(db.get_request(alive)["images"] == [], "битые ссылки на картинки из базы вычищены")
+
+    print("\n20. Снятие прогона убивает и подпроцессы агента")
+
+    def alive_in_group(pgid: int) -> int:
+        """Сколько процессов ещё числится в группе прогона."""
+        found = subprocess.run(["pgrep", "-g", str(pgid)], capture_output=True, text=True)
+        return len(found.stdout.split())
+
+    # Агент плодит подпроцессы, и раньше сигнал уходил одному pid: внуки
+    # оставались жить, а рабочую копию у них тут же сносили из-под ног.
+    runner = await asyncio.create_subprocess_exec(
+        "bash", "-c", "sleep 60 & sleep 60",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    await asyncio.sleep(0.5)
+    check(alive_in_group(runner.pid) > 1, "у прогона появились подпроцессы")
+    codex_runner.RUNNING[0] = runner
+    check(await codex_runner.terminate(0), "прогон снят")
+    codex_runner.RUNNING.pop(0, None)
+    for _ in range(20):
+        if alive_in_group(runner.pid) == 0:
+            break
+        await asyncio.sleep(0.1)
+    check(alive_in_group(runner.pid) == 0, "сирот от прогона не осталось")
+
+    print("\n21. Проверка, которой нет, не держит заявку вечно")
+    stuck = db.create_request("anna", "Заявка ждёт проверку, которая не запускается")
+    db.update_request(
+        stuck, status=pipeline.CHECKING, head_sha="c0ffee", pr_number=7, checks_status="missing"
+    )
+
+    async def fake_missing_state(sha: str) -> dict[str, str]:
+        return {"status": "missing", "detail": "проверка «tests» пока не запускалась", "url": ""}
+
+    github.check_state = fake_missing_state  # type: ignore[assignment]
+    await pipeline.refresh_checks(db.get_request(stuck))
+    check(db.get_request(stuck)["status"] == pipeline.CHECKING, "пока срок не вышел — ждём дальше")
+    # Отматываем метку времени назад: ждать в тесте настоящие полчаса незачем.
+    connection = db.connect()
+    connection.execute("UPDATE requests SET updated_at = ? WHERE id = ?", ("2020-01-01T00:00:00+00:00", stuck))
+    connection.commit()
+    await pipeline.refresh_checks(db.get_request(stuck))
+    late = db.get_request(stuck)
+    check(late["status"] == pipeline.REVIEW, f"заявку вернули человеку (получено: {late['status']})")
+    check(
+        any("не запустилась" in event["text"] for event in db.list_events(stuck)),
+        "человеку объяснили, что решение теперь за ним",
+    )
 
     print("\nВсё прошло.")
 
