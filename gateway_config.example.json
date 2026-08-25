@@ -1,0 +1,17 @@
+{
+  "sandbox_mode": "danger-full-access",
+  "approval_policy": "never",
+  "model": null,
+  "users": {
+    "alice": {
+      "token": "REPLACE_WITH_LONG_RANDOM_TOKEN_1",
+      "workdir": "/opt/project-repo-alice",
+      "display_name": "Алиса"
+    },
+    "bob": {
+      "token": "REPLACE_WITH_LONG_RANDOM_TOKEN_2",
+      "workdir": "/opt/project-repo-bob",
+      "display_name": "Боб"
+    }
+  }
+}

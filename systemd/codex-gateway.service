@@ -1,0 +1,18 @@
+[Unit]
+Description=Codex Team Gateway (веб-чат для коллег к Codex CLI)
+After=network.target
+
+[Service]
+Type=simple
+User=codex
+WorkingDirectory=/opt/codex-team-gateway
+Environment=CODEX_GATEWAY_CONFIG=/etc/codex-gateway/config.json
+Environment=CODEX_GATEWAY_STATE_DIR=/opt/codex-team-gateway/state
+Environment=CODEX_GATEWAY_LOG_DIR=/opt/codex-team-gateway/logs
+Environment=CODEX_BIN=/usr/local/bin/codex
+ExecStart=/opt/codex-team-gateway/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
