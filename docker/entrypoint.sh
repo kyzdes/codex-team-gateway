@@ -25,6 +25,13 @@ fi
 # поэтому проверку владельца в git нужно ослабить осознанно.
 git config --system --add safe.directory '*'
 
+# На части хостингов git по HTTP/2 рвётся на всём, что крупнее пары мегабайт:
+# GET info/refs проходит, а POST git-upload-pack возвращает 401 Basic realm,
+# и клон публичного репозитория выглядит как «could not read Username».
+# Пойман на HostBRR: крошечный репозиторий клонируется, git/git — уже нет.
+# HTTP/1.1 стоит копейки и снимает целый класс необъяснимых отказов клона.
+git config --system http.version HTTP/1.1
+
 run_as_agent() { gosu agent env HOME="$AGENT_HOME" "$@"; }
 
 if run_as_agent codex login status >/dev/null 2>&1; then
