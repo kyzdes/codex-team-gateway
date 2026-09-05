@@ -140,6 +140,26 @@ def _auth_env(token: str) -> dict[str, str] | None:
     }
 
 
+def _trust_dirs(env: dict[str, str], cwd: Path | None) -> dict[str, str]:
+    """Разрешить агенту работать в чужой по владельцу рабочей копии.
+
+    Копию заводит шлюз, а команды в ней выполняет агент — для git это
+    «dubious ownership», и он отказывается работать. Общий `safe.directory=*`
+    здесь не годится: он снял бы проверку и там, где ей самое место. Поэтому
+    называем ровно два каталога и ровно на одну команду: саму рабочую копию и
+    копию шлюза, куда указывает её `.git` (без второго git не найдёт объекты).
+    """
+    trusted = [str(settings.repo_dir)]
+    if cwd:
+        trusted.append(str(cwd))
+    start = int(env.get("GIT_CONFIG_COUNT", "0"))
+    for offset, path in enumerate(trusted):
+        env[f"GIT_CONFIG_KEY_{start + offset}"] = "safe.directory"
+        env[f"GIT_CONFIG_VALUE_{start + offset}"] = path
+    env["GIT_CONFIG_COUNT"] = str(start + len(trusted))
+    return env
+
+
 def _harden(env: dict[str, str]) -> dict[str, str]:
     """Дописать в GIT_CONFIG_* глушилки исполняемых крючков.
 
@@ -177,7 +197,7 @@ async def git(
     token = github_token()
     if as_agent:
         argv = codex_runner.agent_command(["git", *args])
-        env = codex_runner.clean_env()
+        env = _trust_dirs(codex_runner.clean_env(), cwd)
     else:
         argv = ["git", *args]
         extra = _auth_env(token) if auth else None
@@ -302,6 +322,24 @@ def worktree_path(request_id: int) -> Path:
     return settings.worktrees_dir / f"req-{request_id}"
 
 
+def _open_worktree_meta(request_id: int) -> None:
+    """Вернуть агенту запись в служебный каталог его собственной копии.
+
+    _lock_repo закрывает .git/worktrees целиком, и это правильно: там лежит
+    commondir, подменой которого агент увёл бы git шлюза в чужой репозиторий.
+    Но внутри, в .git/worktrees/req-N, git держит индекс и HEAD этой копии —
+    без записи туда агент не может сделать даже `git add`. Открываем ровно
+    один подкаталог: соседние заявки и общий конфиг остаются закрытыми.
+    """
+    meta = settings.repo_dir / ".git" / "worktrees" / worktree_path(request_id).name
+    if not meta.is_dir():
+        return
+    try:
+        os.chmod(meta, 0o2775)
+    except OSError as exc:
+        logger.warning("Не удалось открыть агенту %s: %s", meta, exc)
+
+
 async def create_worktree(request_id: int) -> tuple[Path, str]:
     """Свежая рабочая копия заявки от актуального origin/<base>.
 
@@ -329,6 +367,7 @@ async def create_worktree(request_id: int) -> tuple[Path, str]:
         # `worktree add` только что завёл .git/worktrees — закрываем каталог от
         # агента: в нём лежит commondir, а он указывает git, откуда брать конфиг.
         _lock_repo()
+        _open_worktree_meta(request_id)
     return path, branch
 
 
