@@ -140,24 +140,24 @@ def _auth_env(token: str) -> dict[str, str] | None:
     }
 
 
-def _trust_dirs(env: dict[str, str], cwd: Path | None) -> dict[str, str]:
-    """Разрешить агенту работать в чужой по владельцу рабочей копии.
+def _trusted_flags(cwd: Path | None) -> list[str]:
+    """Аргументы `-c safe.directory=…` для команд от имени агента.
 
     Копию заводит шлюз, а команды в ней выполняет агент — для git это
     «dubious ownership», и он отказывается работать. Общий `safe.directory=*`
-    здесь не годится: он снял бы проверку и там, где ей самое место. Поэтому
-    называем ровно два каталога и ровно на одну команду: саму рабочую копию и
-    копию шлюза, куда указывает её `.git` (без второго git не найдёт объекты).
+    не годится: он снял бы проверку и там, где ей самое место. Называем ровно
+    два каталога: рабочую копию заявки и копию шлюза, куда указывает её `.git`
+    (без второго git не найдёт объекты).
+
+    Именно аргументами, а не через GIT_CONFIG_*: команду агента запускает sudo,
+    а он по умолчанию вычищает окружение — проверено на сервере, переменные до
+    git не доезжают, и заявка падает с «dubious ownership» на ровном месте.
     """
-    trusted = [str(settings.repo_dir)]
-    if cwd:
-        trusted.append(str(cwd))
-    start = int(env.get("GIT_CONFIG_COUNT", "0"))
-    for offset, path in enumerate(trusted):
-        env[f"GIT_CONFIG_KEY_{start + offset}"] = "safe.directory"
-        env[f"GIT_CONFIG_VALUE_{start + offset}"] = path
-    env["GIT_CONFIG_COUNT"] = str(start + len(trusted))
-    return env
+    flags: list[str] = []
+    for path in (settings.repo_dir, cwd):
+        if path:
+            flags += ["-c", f"safe.directory={path}"]
+    return flags
 
 
 def _harden(env: dict[str, str]) -> dict[str, str]:
@@ -196,8 +196,8 @@ async def git(
     # с которым команда и работала.
     token = github_token()
     if as_agent:
-        argv = codex_runner.agent_command(["git", *args])
-        env = _trust_dirs(codex_runner.clean_env(), cwd)
+        argv = codex_runner.agent_command(["git", *_trusted_flags(cwd), *args])
+        env = codex_runner.clean_env()
     else:
         argv = ["git", *args]
         extra = _auth_env(token) if auth else None
