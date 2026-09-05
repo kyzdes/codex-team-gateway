@@ -357,6 +357,10 @@ async def _publish_for_review(
         await emit(request_id, "error", "Тесты проекта не прошли — правка не отправлена")
         return
 
+    # Факты о правке сохраняем до отправки: если пуш или PR сорвутся, человек
+    # всё равно должен видеть, что именно агент сделал, а не пустую карточку.
+    db.update_request(request_id, **fields)
+
     await emit(request_id, "progress", "Отправляю правку на проверку")
     await gitops.push_branch(path, branch)
 
@@ -433,12 +437,40 @@ async def _handle_agent_result(
     await _publish_for_review(request_id, request, path, branch, fields)
 
 
+# Технические отказы, которые человек увидит в карточке. Слева — примета в
+# тексте ошибки, справа — то, что сотруднику реально поможет.
+HUMAN_ERRORS: tuple[tuple[str, str], ...] = (
+    (
+        "could not read Username",
+        "Шлюзу не выдан доступ к GitHub — правка сделана, но отправить её некуда. "
+        "Сообщите администратору: нужен GITHUB_TOKEN.",
+    ),
+    (
+        "Authentication failed",
+        "GitHub не принял доступ шлюза. Сообщите администратору: токен истёк или отозван.",
+    ),
+    ("GITHUB_TOKEN не задан", "Шлюзу не выдан доступ к GitHub. Сообщите администратору."),
+)
+
+
+def humanize(message: str) -> str:
+    """Показать нетехническому человеку причину, а не вывод git.
+
+    Полный технический текст никуда не девается: он остаётся в ленте события
+    и в логе прогона, куда смотрит администратор.
+    """
+    for marker, human in HUMAN_ERRORS:
+        if marker in message:
+            return human
+    return message
+
+
 async def _guarded(request_id: int, what: str, coro: Any) -> None:
     try:
         await coro
     except (gitops.GitError, github.GitHubError) as exc:
         logger.warning("Заявка %s: %s — %s", request_id, what, exc)
-        set_status(request_id, FAILED, error=str(exc))
+        set_status(request_id, FAILED, error=humanize(str(exc)))
         await emit(request_id, "error", f"{what}: {exc}")
     except Exception as exc:  # noqa: BLE001 — заявка не должна падать молча
         logger.exception("Заявка %s: «%s» — внутренняя ошибка", request_id, what)
