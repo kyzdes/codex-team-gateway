@@ -338,11 +338,15 @@ async def _close_without_changes(request_id: int, fields: dict[str, Any], feed: 
     await emit(request_id, "system", feed)
 
 
-async def _collect_facts(path: Path, request_id: int, title: str) -> gitops.Facts:
-    """Подстраховка: агент мог забыть закоммитить — тогда коммитим за него."""
+async def _collect_facts(path: Path, branch: str, request_id: int, title: str) -> gitops.Facts:
+    """Подстраховка: агент мог забыть закоммитить — тогда коммитим за него.
+
+    Дальше факты считаются уже по ветке в копии шлюза, а не по рабочей копии:
+    её содержимое, включая настройки git, правит агент.
+    """
     if await gitops.has_uncommitted(path):
         await gitops.commit_all(path, title or f"Заявка #{request_id}")
-    return await gitops.collect_facts(path)
+    return await gitops.collect_facts(branch)
 
 
 async def _publish_for_review(
@@ -362,7 +366,7 @@ async def _publish_for_review(
     db.update_request(request_id, **fields)
 
     await emit(request_id, "progress", "Отправляю правку на проверку")
-    await gitops.push_branch(path, branch)
+    await gitops.push_branch(branch)
 
     title = fields["title"] or f"Заявка #{request_id}"
     body = (
@@ -420,7 +424,7 @@ async def _handle_agent_result(
         await _close_without_changes(request_id, fields, "Агент считает, что менять ничего не нужно")
         return
 
-    facts = await _collect_facts(path, request_id, fields["title"])
+    facts = await _collect_facts(path, branch, request_id, fields["title"])
     if facts.commits == 0:
         fields["summary"] = fields["summary"] or "Изменений в проекте не появилось."
         await _close_without_changes(request_id, fields, "Файлы проекта не изменились")
@@ -443,7 +447,7 @@ HUMAN_ERRORS: tuple[tuple[str, str], ...] = (
     (
         "could not read Username",
         "Шлюзу не выдан доступ к GitHub — правка сделана, но отправить её некуда. "
-        "Сообщите администратору: нужен GITHUB_TOKEN.",
+        "Сообщите администратору: нужен ключ GitHub.",
     ),
     (
         "Authentication failed",

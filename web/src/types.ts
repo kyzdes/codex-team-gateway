@@ -92,6 +92,33 @@ export interface ReadinessResponse {
   problems: string[];
 }
 
+/**
+ * Откуда шлюз берёт токен GitHub. Значение из интерфейса важнее переменной
+ * окружения: администратор меняет его без редеплоя, env остаётся затравкой.
+ */
+export type GithubTokenSource = "ui" | "env" | "none";
+
+/**
+ * Состояние доступа к GitHub (/api/admin/github-token).
+ *
+ * Самого токена здесь нет и не будет: наружу отдаётся только хвост из четырёх
+ * символов — его хватает, чтобы отличить один ключ от другого, и не хватает,
+ * чтобы им воспользоваться.
+ */
+export interface GithubTokenState {
+  configured: boolean;
+  source: GithubTokenSource;
+  /** Хвост вида «…f3a2»; пустая строка, когда токена нет вовсе. */
+  hint: string;
+  /** Репозиторий, на который должен быть выдан PAT. */
+  repo: string;
+  /** Итог боевой проверки; null — токен ещё ни разу не проверяли. */
+  can_push: boolean | null;
+  checked_at: string | null;
+  /** Чем закончилась последняя проверка, если она сорвалась. */
+  error: string | null;
+}
+
 /** Строка расхода токенов по человеку (/api/admin/usage). */
 export interface UsageRow {
   user: string;

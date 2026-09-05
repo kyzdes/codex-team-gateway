@@ -29,7 +29,7 @@ from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, bus, codex_runner, db, deploy, github, gitops, pipeline, uploads
+from . import auth, bus, codex_runner, config, db, deploy, github, gitops, pipeline, uploads
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,38 @@ GITHUB_API = "https://api.github.com"
 PROBE_TIMEOUT = 20
 
 
+# Прогрев локальной копии проекта — строго одна задача на процесс: второй
+# параллельный клон писал бы в тот же каталог поверх первого.
+_warmup: asyncio.Task[None] | None = None
+
+
+async def warm_repo() -> None:
+    """Клон проекта занимает минуты — тянем его в фоне, чтобы старт не ждал.
+
+    Упавший клон сервис не роняет: администратор увидит это пунктом
+    «Локальная копия проекта» в чек-листе готовности.
+    """
+    try:
+        await gitops.ensure_repo()
+    except Exception as exc:  # noqa: BLE001 — сервис поднимается и без копии
+        logger.warning("Копия проекта не подготовилась: %s", exc)
+
+
+def warm_repo_in_background() -> None:
+    """Поставить прогрев копии в фон, если он не идёт прямо сейчас.
+
+    Зовётся не только на старте, но и сразу после того, как администратор
+    вписал ключ GitHub. На свежем инстансе стартовый клон приватного
+    репозитория падает из-за отсутствия доступа, и без повторной попытки
+    пункт «Локальная копия проекта» оставался бы красным до перезапуска —
+    то есть до ровно того редеплоя, ради отмены которого форма и делалась.
+    """
+    global _warmup
+    if _warmup is not None and not _warmup.done():
+        return
+    _warmup = asyncio.create_task(warm_repo())
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     db.connect()
@@ -52,22 +84,14 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     auth.seed_people()
     await pipeline.recover_after_restart()
 
-    async def warm_repo() -> None:
-        """Клон проекта занимает минуты — тянем его в фоне, чтобы старт не ждал.
-
-        Упавший клон сервис не роняет: администратор увидит это пунктом
-        «Локальная копия проекта» в чек-листе готовности.
-        """
-        try:
-            await gitops.ensure_repo()
-        except Exception as exc:  # noqa: BLE001 — сервис поднимается и без копии
-            logger.warning("Копия проекта не подготовилась: %s", exc)
-
-    tasks = [asyncio.create_task(pipeline.checks_watcher()), asyncio.create_task(warm_repo())]
+    warm_repo_in_background()
+    tasks = [asyncio.create_task(pipeline.checks_watcher())]
     try:
         yield
     finally:
-        for task in tasks:
+        for task in [*tasks, _warmup]:
+            if task is None:
+                continue
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
@@ -435,10 +459,14 @@ async def github_api(path: str, params: dict[str, str] | None = None) -> tuple[i
     В рабочем цикле заявки они не участвуют, поэтому общему слою github.py
     не принадлежат: там живёт ровно то, без чего заявка не доедет до сайта.
     """
-    if not settings.github_token:
-        raise github.GitHubError("GITHUB_TOKEN не задан — проверять нечем")
+    key = config.github_token()
+    if not key:
+        raise github.GitHubError(
+            "Ключ GitHub не задан — проверять нечем. "
+            "Впишите его в админке, вкладка «Настройки»."
+        )
     headers = {
-        "Authorization": f"Bearer {settings.github_token}",
+        "Authorization": f"Bearer {key}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
@@ -460,7 +488,12 @@ async def probe_github_token() -> tuple[bool, str]:
         return False, str(data.get("error") or "GitHub не ответил")
     if not data.get("can_push"):
         return False, f"{data.get('repo')}: репозиторий виден, но записывать в него токен не может"
-    return True, f"{data.get('repo')}: чтение и запись доступны"
+    # Пункт чек-листа требует ещё и прав на Pull requests, а в permissions
+    # репозитория их не видно — поэтому спрашиваем отдельно и не красим
+    # зелёным то, чего не проверяли.
+    if data.get("pull_requests") is False:
+        return False, f"{data.get('repo')}: писать в файлы можно, но к pull requests токен не пускают"
+    return True, f"{data.get('repo')}: запись в файлы и pull requests доступны"
 
 
 async def probe_branch_protection() -> tuple[bool, str]:
@@ -594,7 +627,8 @@ async def admin_readiness(_: Principal = Depends(admin_only)) -> dict[str, Any]:
         (
             "github_token",
             "Доступ к GitHub",
-            "Fine-grained PAT на этот репозиторий: Contents — Read and write, Pull requests — Read and write.",
+            "Fine-grained PAT на этот репозиторий: Contents — Read and write, Pull requests — Read and write. "
+            "Вписывается на вкладке «Настройки» и действует сразу, без перезапуска.",
             probe_github_token,
         ),
         (
@@ -647,6 +681,212 @@ async def admin_readiness(_: Principal = Depends(admin_only)) -> dict[str, Any]:
     # Опечатка в переменной окружения не ловится ни одной проверкой выше:
     # там смотрят на внешний мир, а тут — на то, с чем запустился сам шлюз.
     return {"checks": list(checks), "problems": settings.problems()}
+
+
+# --- админка: ключ GitHub -------------------------------------------------
+
+# Ключ в таблице настроек тот же, что читает config.github_token(), поэтому
+# сохранённое значение действует со следующего запроса: ни перезапуска, ни
+# редеплоя не нужно — ради этого форма и делалась.
+GITHUB_TOKEN_KEY = "github_token"
+GITHUB_TOKEN_CHECKED_KEY = "github_token_checked_at"
+
+# Fine-grained PAT — это github_pat_… под сотню символов, classic — сорок.
+# Границы намеренно широкие: дело проверки формы — отсечь «вставил не то
+# поле», а годность ключа всё равно решает сам GitHub.
+TOKEN_MIN_LEN = 20
+TOKEN_MAX_LEN = 255
+
+
+def token_hint(token: str) -> str:
+    """«…f3a2» — ровно столько, чтобы отличить один ключ от другого.
+
+    Подсказка уходит и в интерфейс, и в лог, поэтому больше четырёх символов
+    не отдаём нигде и никогда: остаток токена — это уже часть секрета.
+    """
+    if not token:
+        return ""
+    if len(token) < 8:
+        # Такой короткой строки у настоящего ключа не бывает, но если она
+        # сюда попала, хвост из четырёх символов — это половина значения.
+        return "…"
+    return f"…{token[-4:]}"
+
+
+def github_token_state() -> dict[str, Any]:
+    """Что шлюз знает о ключе GitHub, без самого ключа.
+
+    Живьём в GitHub отсюда не ходим: вкладку «Настройки» открывают часто, а
+    правду о токене в реальном времени показывает чек-лист готовности.
+    can_push и checked_at — это память о боевой проверке, которую ключ прошёл
+    в момент сохранения, а не состояние прямо сейчас.
+    """
+    stored = db.get_setting(GITHUB_TOKEN_KEY)
+    effective = config.github_token()
+    # Значение из интерфейса важнее env, поэтому непустой stored — это всегда
+    # «ui», а непустой действующий ключ без stored мог прийти только из env.
+    source = "ui" if stored else ("env" if effective else "none")
+    checked_at = db.get_setting(GITHUB_TOKEN_CHECKED_KEY) if source == "ui" else ""
+    # Без PROJECT_REPO проверять ключ не на чем, и молчать об этом нельзя:
+    # администратор будет вставлять токен за токеном и не поймёт, почему
+    # «Доступ к GitHub» остаётся красным.
+    error = None if settings.repo else "PROJECT_REPO не задан — проверять ключ не на чем"
+    return {
+        "configured": source != "none",
+        "source": source,
+        "hint": token_hint(effective),
+        "repo": settings.repo,
+        # Сохраняем ключ только после успешной проверки на запись, поэтому у
+        # «ui» право писать было; про ключ из env этой ручке ничего не известно.
+        "can_push": True if source == "ui" else None,
+        "checked_at": checked_at or None,
+        "error": error,
+    }
+
+
+def validated_token(raw: str) -> str:
+    """Форма ключа. Человеческий отказ здесь дешевле похода в GitHub."""
+    # Из буфера обмена регулярно приезжают перенос строки и пробел по краям —
+    # это не повод отказывать. А вот пробел внутри значит, что скопировали не
+    # ключ, а строку вокруг него.
+    token = raw.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Поле пустое — вставьте ключ.")
+    if any(char.isspace() for char in token):
+        raise HTTPException(
+            status_code=400,
+            detail="В ключе есть пробел или перенос строки — похоже, скопировалось лишнее.",
+        )
+    if not token.isascii() or not token.isprintable():
+        # Кириллица и управляющие символы не переживут заголовок Authorization:
+        # запрос упадёт где-то в глубине httpx, и причину придётся угадывать.
+        raise HTTPException(
+            status_code=400,
+            detail="В ключе есть посторонние символы — в токене GitHub только латиница и цифры.",
+        )
+    if not TOKEN_MIN_LEN <= len(token) <= TOKEN_MAX_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Ключ должен быть длиной от {TOKEN_MIN_LEN} до {TOKEN_MAX_LEN} символов, "
+                f"а в этом — {len(token)}."
+            ),
+        )
+    return token
+
+
+async def check_token_can_push(token: str) -> None:
+    """Боевая проверка ключа: видит ли он репозиторий и может ли в него писать.
+
+    Спрашиваем GitHub до сохранения. Подменить рабочий ключ на нерабочий и
+    узнать об этом на первой же заявке — худшее, что может случиться с этой
+    формой, поэтому непроверенное значение в базу не попадает.
+    """
+    try:
+        result = await github.token_check(token)
+    except httpx.HTTPError as exc:
+        # Наружу — ни текста исключения, ни адреса: они ходили рядом с ключом,
+        # а администратору хватит и того, что связаться не удалось.
+        logger.warning("Проверка ключа GitHub не состоялась: %s", exc.__class__.__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="Не удалось связаться с GitHub, чтобы проверить ключ. Попробуйте ещё раз.",
+        ) from exc
+
+    if not result.get("ok"):
+        # Ответ GitHub дописываем к своей формулировке: за отказом стоит не
+        # только «не тот PAT», но и запрет организации (SSO, политика PAT), а
+        # его без текста GitHub администратор будет искать не там. Ключ из
+        # чужого текста вырезаем, даже если GitHub его никогда не возвращает.
+        answer = str(result.get("error") or "GitHub не объяснил отказ").replace(token, "***")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Этот токен не видит репозиторий {settings.repo}. "
+                f"Проверьте, что PAT выдан на него. ({answer})"
+            ),
+        )
+    if not result.get("can_push"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Токен видит репозиторий, но не может писать. Нужны права "
+                "Contents: Read and write и Pull requests: Read and write."
+            ),
+        )
+    # Права на Pull requests — отдельный переключатель PAT, и в правах
+    # репозитория его не видно. Без этой проверки ключ сохранялся зелёным, а
+    # заявка падала на открытии PR: прогон агента уже оплачен, ветка ушла, а
+    # сотрудник видит сырое «Resource not accessible by personal access token».
+    if result.get("pull_requests") is False:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Токен видит репозиторий и может писать в файлы, но не имеет прав "
+                "Pull requests: Read and write — открыть pull request он не сможет. "
+                "Добавьте это право в настройках PAT."
+            ),
+        )
+
+
+class GithubTokenIn(BaseModel):
+    # Ограничений через Field здесь нет намеренно: на их нарушение FastAPI
+    # отвечает 422, а в теле такого ответа лежит отвергнутое значение — то
+    # есть сам ключ. Форму проверяет validated_token и отвечает текстом.
+    token: str
+
+
+@app.get("/api/admin/github-token")
+async def admin_github_token(_: Principal = Depends(admin_only)) -> dict[str, Any]:
+    """Состояние доступа к GitHub. Самого ключа в ответе нет — только хвост."""
+    return github_token_state()
+
+
+@app.put("/api/admin/github-token")
+async def admin_save_github_token(
+    payload: GithubTokenIn, user: Principal = Depends(admin_only)
+) -> dict[str, Any]:
+    """Сохранить ключ — но только после того, как GitHub подтвердит его боем."""
+    token = validated_token(payload.token)
+    if not settings.repo:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "PROJECT_REPO не задан, и проверять ключ не на чем. "
+                "Сначала укажите репозиторий в переменных окружения инстанса."
+            ),
+        )
+    await check_token_can_push(token)
+    db.set_setting(GITHUB_TOKEN_KEY, token)
+    db.set_setting(
+        GITHUB_TOKEN_CHECKED_KEY, datetime.now(timezone.utc).isoformat(timespec="seconds")
+    )
+    # В логе — только хвост и длина: журнал шлюза читают и в поддержке, и в
+    # чужих глазах он не должен превращаться в готовый доступ к репозиторию.
+    logger.info(
+        "%s заменил ключ GitHub через интерфейс: %s, длина %d",
+        user.login,
+        token_hint(token),
+        len(token),
+    )
+    # Ключ обычно вписывают на инстансе, где стартовый клон приватного
+    # репозитория уже провалился. Пробуем ещё раз прямо сейчас, чтобы человек
+    # увидел зелёный чек-лист, а не остался с красной «Локальной копией».
+    warm_repo_in_background()
+    return github_token_state()
+
+
+@app.delete("/api/admin/github-token")
+async def admin_forget_github_token(user: Principal = Depends(admin_only)) -> dict[str, Any]:
+    """Забыть ключ из интерфейса и вернуться к переменной окружения.
+
+    Пишем пустое значение вместо удаления строки: config.github_token()
+    считает пустое отсутствующим и сам падает обратно на env.
+    """
+    db.set_setting(GITHUB_TOKEN_KEY, "")
+    db.set_setting(GITHUB_TOKEN_CHECKED_KEY, "")
+    logger.info("%s удалил ключ GitHub, заданный через интерфейс", user.login)
+    return github_token_state()
 
 
 # --- админка: расход и журнал --------------------------------------------

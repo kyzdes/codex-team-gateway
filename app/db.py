@@ -120,7 +120,10 @@ def _restrict_permissions() -> None:
         (settings.db_path, 0o600),
         (settings.db_path.with_name(settings.db_path.name + "-wal"), 0o600),
         (settings.db_path.with_name(settings.db_path.name + "-shm"), 0o600),
-        (settings.logs_dir, 0o750),
+        # Каталог логов — 0700, а не 0750: агент и шлюз состоят в одной группе,
+        # поэтому групповое r-x означает «агент читает переписку по всем чужим
+        # заявкам», ровно то, что этот метод и обязан закрыть.
+        (settings.logs_dir, 0o700),
     )
     for path, mode in targets:
         if not path.exists():

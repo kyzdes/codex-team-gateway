@@ -11,29 +11,44 @@ from typing import Any
 
 import httpx
 
-from .config import settings
+from .config import github_token, settings
 
 API = "https://api.github.com"
 
 
 class GitHubError(RuntimeError):
-    pass
+    """Отказ GitHub. Код ответа держим отдельным полем: по нему отличают
+    «нет такого права» (403/404) от «GitHub прилёг» (5xx), а разбирать это
+    из текста значило бы гадать по чужой формулировке."""
+
+    def __init__(self, message: str, status: int = 0) -> None:
+        super().__init__(message)
+        self.status = status
 
 
-def _headers() -> dict[str, str]:
+def _headers(token: str) -> dict[str, str]:
     return {
-        "Authorization": f"Bearer {settings.github_token}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
 
-async def _request(method: str, path: str, **kwargs: Any) -> Any:
-    if not settings.github_token:
-        raise GitHubError("GITHUB_TOKEN не задан — обращаться к GitHub нечем")
+async def _request(method: str, path: str, *, token: str | None = None, **kwargs: Any) -> Any:
+    """Запрос к GitHub действующим токеном шлюза.
+
+    `token` передают только там, где проверяют ещё не сохранённого кандидата:
+    в остальных случаях источник один — config.github_token().
+    """
+    auth = token if token is not None else github_token()
+    if not auth:
+        raise GitHubError(
+            "GITHUB_TOKEN не задан — обращаться к GitHub нечем: "
+            "впишите токен в админке или задайте переменную окружения"
+        )
     url = f"{API}{path}"
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.request(method, url, headers=_headers(), **kwargs)
+        response = await client.request(method, url, headers=_headers(auth), **kwargs)
     if response.status_code >= 400:
         detail = ""
         try:
@@ -44,7 +59,7 @@ async def _request(method: str, path: str, **kwargs: Any) -> Any:
                     detail += f" — {err['message']}"
         except ValueError:
             detail = response.text[:300]
-        raise GitHubError(f"GitHub {response.status_code}: {detail}")
+        raise GitHubError(f"GitHub {response.status_code}: {detail}", response.status_code)
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
@@ -143,10 +158,44 @@ async def close_pull_request(number: int) -> None:
     await _request("PATCH", f"/repos/{settings.repo}/pulls/{number}", json={"state": "closed"})
 
 
-async def token_check() -> dict[str, Any]:
-    """Проверка доступа для админки: видим ли репозиторий и можем ли писать."""
+async def pull_requests_readable(token: str | None = None) -> bool | None:
+    """Виден ли токену список pull request-ов.
+
+    Отдельным запросом, потому что в `permissions` репозитория этого права
+    просто нет: там {admin, maintain, push, triage, pull} — про Contents, а
+    Pull requests у fine-grained PAT выдаются отдельным переключателем.
+    Заявка без него доходит до самого конца и падает на create_pull_request,
+    когда прогон агента уже оплачен, а рабочая копия вот-вот будет снесена.
+
+    Ответ трёхзначный: True — список отдали, False — прав нет, None — GitHub
+    ответил чем-то другим (лежит, лимит), и объявлять это виной ключа нельзя.
+    """
     try:
-        repo = await _request("GET", f"/repos/{settings.repo}")
+        await _request(
+            "GET", f"/repos/{settings.repo}/pulls", token=token,
+            params={"state": "all", "per_page": 1},
+        )
+    except GitHubError as exc:
+        # 404 здесь — тот же отказ в доступе: GitHub прячет то, чего токену
+        # не положено видеть, вместо честного 403.
+        return False if exc.status in (403, 404) else None
+    return True
+
+
+async def token_check(token: str | None = None) -> dict[str, Any]:
+    """Проверка доступа для админки: видим ли репозиторий, можем ли писать и
+    пускают ли нас к pull request-ам.
+
+    Без аргумента проверяется действующий токен (чек-лист готовности), с
+    аргументом — кандидат, которого администратор только что ввёл: класть в
+    базу непроверенное значение значит чинить доступ вслепую.
+
+    pull_requests проверяет доступ к pull request-ам чтением: право на запись
+    в них без создания настоящего PR не проверить ничем. Зато так ловится
+    главный случай — переключатель Pull requests не тронут вовсе.
+    """
+    try:
+        repo = await _request("GET", f"/repos/{settings.repo}", token=token)
     except GitHubError as exc:
         return {"ok": False, "error": str(exc)}
     permissions = repo.get("permissions") or {}
@@ -155,5 +204,6 @@ async def token_check() -> dict[str, Any]:
         "repo": repo.get("full_name"),
         "private": repo.get("private"),
         "can_push": bool(permissions.get("push")),
+        "pull_requests": await pull_requests_readable(token),
         "default_branch": repo.get("default_branch"),
     }

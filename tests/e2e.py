@@ -296,6 +296,7 @@ async def main() -> None:
         "/api/admin/requests/{request_id}/tests",
         "/api/admin/requests/{request_id}/force-cancel",
         "/api/admin/requests/{request_id}/recheck",
+        "/api/admin/github-token",
     ):
         check(path in paths, f"есть {path}")
 
@@ -460,6 +461,169 @@ async def main() -> None:
         any("не запустилась" in event["text"] for event in db.list_events(stuck)),
         "человеку объяснили, что решение теперь за ним",
     )
+
+    print("\n22. Ключ GitHub вписывают в админке")
+    # Единственная часть шлюза, где секрет ходит через HTTP, поэтому и
+    # проверяем её через настоящее ASGI-приложение: роли, коды и — главное —
+    # тела ответов должны быть ровно такими, какими их увидит браузер.
+    import base64
+
+    import httpx
+
+    from app import auth, config, gitops
+
+    auth.seed_people()
+    admin_key = (db.get_person("admin") or {}).get("token", "")
+    worker_key = (db.get_person("anna") or {}).get("token", "")
+    check(admin_key == "admin-token", "администратор входит по ADMIN_TOKEN")
+    check(bool(worker_key) and worker_key != admin_key, "у сотрудника свой токен")
+
+    transport = httpx.ASGITransport(app=api.app)
+
+    async def call(method: str, key: str, body: dict[str, Any] | None = None) -> httpx.Response:
+        """Запрос к ручке ключа от имени владельца токена `key`."""
+        async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+            return await client.request(
+                method,
+                "/api/admin/github-token",
+                headers={"Authorization": f"Bearer {key}"},
+                json=body,
+            )
+
+    env_token = settings.github_token_env
+    check(env_token == "dummy-token", "в окружении лежит затравочный ключ")
+
+    for method, body in (("GET", None), ("PUT", {"token": "g" * 40}), ("DELETE", None)):
+        answer = await call(method, worker_key, body)
+        check(answer.status_code == 403, f"{method} для сотрудника — 403 (получено: {answer.status_code})")
+        check(env_token not in answer.text, f"{method} не показал сотруднику ключ")
+
+    state = await call("GET", admin_key)
+    check(state.status_code == 200, f"GET отдаёт админу 200 (получено: {state.status_code})")
+    seen = state.json()
+    check(seen["source"] == "env", f"пока база пуста, источник — окружение (получено: {seen['source']})")
+    check(seen["configured"], "ключ из окружения считается настроенным")
+    check(env_token not in state.text, "самого ключа в ответе нет")
+    check(seen["hint"] == "…oken", f"наружу уходит только хвост (получено: {seen['hint']})")
+    check(seen["checked_at"] is None, "ключ из окружения шлюз боем не проверял")
+
+    # Проверку боем подменяем: настоящий GitHub тесту недоступен, а важно
+    # ровно то, что без её успеха ключ в базу не попадает.
+    probed: list[str] = []
+
+    async def accepting_check(token: str | None = None) -> dict[str, Any]:
+        probed.append(str(token))
+        return {"ok": True, "repo": settings.repo, "private": True, "can_push": True}
+
+    github.token_check = accepting_check  # type: ignore[assignment]
+
+    for bad, why in (
+        ({"token": "  ghp коротко  "}, "с пробелом внутри"),
+        ({"token": "short"}, "слишком короткий"),
+        ({"token": "github_pat_кириллица_в_ключе_и_ещё_немного"}, "с кириллицей"),
+    ):
+        answer = await call("PUT", admin_key, bad)
+        check(answer.status_code == 400, f"ключ {why} — 400 (получено: {answer.status_code})")
+        check(
+            isinstance(answer.json().get("detail"), str),
+            f"отказ ({why}) пришёл строкой, а не списком полей",
+        )
+    check(not probed, "в GitHub с заведомо кривым ключом не ходили")
+
+    fresh = "github_pat_" + "A" * 40 + "cafe"
+    saved = await call("PUT", admin_key, {"token": fresh})
+    check(saved.status_code == 200, f"проверенный ключ сохранён (получено: {saved.status_code})")
+    check(probed == [fresh], f"в GitHub сходили именно присланным ключом (получено: {probed})")
+    stored = saved.json()
+    check(stored["source"] == "ui", f"источник стал «интерфейс» (получено: {stored['source']})")
+    check(stored["hint"] == "…cafe", f"хвост нового ключа (получено: {stored['hint']})")
+    check(stored["can_push"] is True, "запомнили, что ключ прошёл проверку на запись")
+    check(bool(stored["checked_at"]), "записано, когда проверяли")
+    check(fresh not in saved.text, "сохранённый ключ обратно не приходит")
+
+    # Ради этого всё и делалось: вписанный в админке ключ важнее переменной
+    # окружения и действует сразу, без перезапуска.
+    check(config.github_token() == fresh, "шлюз берёт ключ из интерфейса, а не из окружения")
+    header = (gitops._auth_env(config.github_token()) or {}).get("GIT_CONFIG_VALUE_0", "")
+    check(
+        base64.b64encode(f"x-access-token:{fresh}".encode()).decode() in header,
+        "git пушит ключом из интерфейса",
+    )
+    check(not any(problem.startswith("Доступ к GitHub") for problem in config.settings.problems()),
+          "чек-лист больше не жалуется на отсутствие доступа")
+
+    again = await call("GET", admin_key)
+    check(fresh not in again.text, "ключа нет и в состоянии после сохранения")
+    check(again.json()["source"] == "ui", "состояние помнит, что ключ вписан руками")
+
+    # Успешное сохранение будит повторный клон: на свежем инстансе стартовый
+    # провалился без доступа, и без этого «Локальная копия» осталась бы красной.
+    check(api._warmup is not None, "после сохранения ключа копию проекта пробуют забрать заново")
+    if api._warmup is not None:
+        await api._warmup
+
+    async def refusing_check(token: str | None = None) -> dict[str, Any]:
+        return {"ok": False, "error": "404 Not Found"}
+
+    github.token_check = refusing_check  # type: ignore[assignment]
+    rejected = "github_pat_" + "B" * 40 + "beef"
+    answer = await call("PUT", admin_key, {"token": rejected})
+    check(answer.status_code == 400, f"невидящий репозиторий ключ отбит (получено: {answer.status_code})")
+    check("не видит репозиторий" in answer.json()["detail"], "отказ объяснён по-человечески")
+    check(config.github_token() == fresh, "прежний ключ на месте")
+
+    async def echoing_check(token: str | None = None) -> dict[str, Any]:
+        # Настоящий GitHub ключ в ответе не возвращает, но его пересказ мы
+        # дописываем к отказу — значит, вырезать ключ надо вслепую, а не
+        # «когда понадобится».
+        return {"ok": False, "error": f"401 Bad credentials: {token}"}
+
+    github.token_check = echoing_check  # type: ignore[assignment]
+    answer = await call("PUT", admin_key, {"token": rejected})
+    check(rejected not in answer.text, "ключ из ответа GitHub в отказ не просочился")
+    check("***" in answer.json()["detail"], "на его месте — маска")
+
+    async def readonly_check(token: str | None = None) -> dict[str, Any]:
+        return {"ok": True, "repo": settings.repo, "private": True, "can_push": False}
+
+    github.token_check = readonly_check  # type: ignore[assignment]
+    answer = await call("PUT", admin_key, {"token": rejected})
+    check(answer.status_code == 400, f"ключ без записи отбит (получено: {answer.status_code})")
+    check("не может писать" in answer.json()["detail"], "сказано, каких прав не хватает")
+
+    async def unreachable_check(token: str | None = None) -> dict[str, Any]:
+        raise httpx.ConnectError("сети нет")
+
+    github.token_check = unreachable_check  # type: ignore[assignment]
+    answer = await call("PUT", admin_key, {"token": rejected})
+    check(answer.status_code == 502, f"обрыв связи — не вина ключа, 502 (получено: {answer.status_code})")
+    check(config.github_token() == fresh, "ни один неудачный ключ не тронул рабочий")
+    check(rejected not in answer.text, "отвергнутый ключ в ответе не повторяется")
+
+    dropped = await call("DELETE", admin_key)
+    check(dropped.status_code == 200, f"удаление отдаёт 200 (получено: {dropped.status_code})")
+    left = dropped.json()
+    check(left["source"] == "env", f"после удаления снова окружение (получено: {left['source']})")
+    check(left["checked_at"] is None, "отметка о проверке снята вместе с ключом")
+    check(config.github_token() == env_token, "шлюз вернулся к переменной окружения")
+    check(fresh not in dropped.text, "удалённый ключ в ответе не всплыл")
+
+    # Ни в базе, ни в окружении: единственное состояние, на которое обязан
+    # ругаться чек-лист готовности.
+    whole = config.settings
+    config.settings = dataclasses.replace(whole, github_token_env="")
+    try:
+        empty = await call("GET", admin_key)
+        bare = empty.json()
+        check(bare["source"] == "none", f"источника нет (получено: {bare['source']})")
+        check(not bare["configured"], "ключ не настроен")
+        check(bare["hint"] == "", "показывать нечего")
+        check(
+            any(problem.startswith("Доступ к GitHub") for problem in config.settings.problems()),
+            "чек-лист требует настроить доступ",
+        )
+    finally:
+        config.settings = whole
 
     print("\nВсё прошло.")
 

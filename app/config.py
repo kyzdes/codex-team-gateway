@@ -70,7 +70,10 @@ class Settings:
     # --- GitHub ---------------------------------------------------------
     # Токен принадлежит ШЛЮЗУ, а не Codex: агент коммитит локально, а пуш,
     # PR и мерж делает сервер по действию человека в интерфейсе.
-    github_token: str = field(default_factory=lambda: _env("GITHUB_TOKEN"))
+    # Это только ЗАТРАВКА первого запуска: рабочее значение читают через
+    # github_token() ниже, потому что администратор меняет токен в интерфейсе,
+    # а переменную окружения без редеплоя не поменять.
+    github_token_env: str = field(default_factory=lambda: _env("GITHUB_TOKEN"))
     required_check: str = field(default_factory=lambda: _env("GITHUB_REQUIRED_CHECK", "tests"))
     merge_method: str = field(default_factory=lambda: _env("GITHUB_MERGE_METHOD", "squash"))
     pr_labels: tuple[str, ...] = field(
@@ -171,8 +174,14 @@ class Settings:
         out: list[str] = []
         if not self.repo or "/" not in self.repo:
             out.append("PROJECT_REPO не задан или не в формате owner/name")
-        if not self.github_token:
-            out.append("GITHUB_TOKEN не задан — шлюз не сможет пушить ветки и открывать PR")
+        # Жалуемся, только если пусты ОБА источника: настроенный через админку
+        # токен — такой же полноценный доступ, как и переменная окружения.
+        if not github_token():
+            out.append(
+                "Доступ к GitHub не настроен — шлюз не сможет пушить ветки и открывать PR. "
+                "Вставьте токен в админке (Настройки → Доступ к GitHub) "
+                "или задайте GITHUB_TOKEN в окружении"
+            )
         if self.codex_sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
             out.append(f"CODEX_SANDBOX={self.codex_sandbox!r} — недопустимое значение")
         if self.merge_method not in {"merge", "squash", "rebase"}:
@@ -198,3 +207,15 @@ settings = Settings()
 
 for _d in (settings.data_dir, settings.repo_dir.parent, settings.worktrees_dir, settings.logs_dir):
     _d.mkdir(parents=True, exist_ok=True)
+
+
+# --- рантайм-секреты ------------------------------------------------------
+
+def github_token() -> str:
+    """Токен из интерфейса важнее переменной окружения: администратор
+    меняет его без редеплоя, а env остаётся затравкой."""
+    # Импорт локальный: db на уровне модуля импортирует settings отсюда,
+    # поэтому обратный импорт наверху файла замкнул бы цикл.
+    from . import db
+
+    return db.get_setting("github_token") or settings.github_token_env

@@ -291,7 +291,14 @@ async def run(
 
     result = CodexResult(thread_id=thread_id)
     last_progress = ""
-    log = log_path.open("w", encoding="utf-8")
+    # Лог прогона — это текст чужой заявки и весь вывод команд агента, поэтому
+    # файл заводим сразу закрытым: umask 002 в контейнере даёт 0664, а агент со
+    # шлюзом в одной группе — то есть по умолчанию агент читал бы и переписку
+    # по чужим заявкам, и мог бы переписать админский аудит. chmod отдельной
+    # строкой: при повторном прогоне файл уже существует, и режим при открытии
+    # не меняется.
+    log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8")
+    os.chmod(log_path, 0o600)
 
     async def pump_stdout() -> None:
         nonlocal last_progress
